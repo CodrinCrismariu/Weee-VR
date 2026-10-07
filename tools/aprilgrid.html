@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AprilGrid Target</title>
+<style>
+  /* Kalibr AprilGrid (10 x 6 tags, tag36h11, spacing 0.3) for the camera-IMU calibration
+     (scripts/calib/run.sh). Open on the big monitor, press F11, then measure one tag. */
+  :root { --bg: #ffffff; --ink: #000000; }
+  html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
+  img { position: fixed; inset: 2vmin; width: calc(100% - 4vmin); height: calc(100% - 4vmin);
+        object-fit: contain; }
+  #help { position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%); max-width: 36em;
+          padding: 1.2em 1.5em; background: #fff; color: var(--ink); border: 2px solid var(--ink);
+          font: 18px/1.45 system-ui, sans-serif; }
+  #help b { font-weight: 650; }
+</style>
+</head>
+<body>
+<img src="aprilgrid.svg" alt="AprilGrid calibration target">
+<div id="help">
+  <b>Calibration target</b><br>
+  1. Press <b>F11</b> for full screen, turn the monitor brightness up, then click anywhere to hide this box.<br>
+  2. With a ruler, measure the width of <b>one black square tag</b> (outer black edge to outer black edge) in millimetres.
+  Measuring across the whole top row and dividing is more accurate: row width = 12.7 × tag width.<br>
+  3. Don't resize or zoom the page afterwards.
+</div>
+<script>
+  document.addEventListener("click", () => { document.getElementById("help").style.display = "none"; });
+</script>
+</body>
+</html>

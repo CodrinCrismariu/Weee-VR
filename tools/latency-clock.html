@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Latency Clock</title>
+<style>
+  :root { --bg: #000; --fg: #fff; --dim: #888; --flash: #fff; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); font-family: ui-monospace, Consolas, monospace; }
+  body { display: grid; place-items: center; overflow: hidden; }
+  main { text-align: center; }
+  #ms { font-size: min(16vw, 22vh); font-weight: 700; letter-spacing: 0.02em; font-variant-numeric: tabular-nums; }
+  #frame { font-size: min(4vw, 6vh); color: var(--dim); }
+  #square { width: 22vh; height: 22vh; margin: 3vh auto 0; border: 2px solid var(--dim); }
+  #square.on { background: var(--flash); }
+  p { color: var(--dim); font-size: 14px; max-width: 70ch; margin: 3vh auto 0; line-height: 1.5; }
+</style>
+</head>
+<body>
+<main>
+  <div id="ms">0000.000</div>
+  <div id="frame">frame 0</div>
+  <div id="square"></div>
+  <p>Point the iPhone (in the app) at this screen. Photograph the PC monitor and the phone screen together with a
+     third camera (or film them in 240 fps slow motion). The PC time minus the time shown inside the passthrough is the
+     glass-to-glass latency, give or take one PC monitor refresh. Press F11 for fullscreen.</p>
+</main>
+<script>
+  const ms = document.getElementById('ms');
+  const frameEl = document.getElementById('frame');
+  const square = document.getElementById('square');
+  let frame = 0;
+  function tick(now) {
+    // Seconds within the current 10 s window, with milliseconds: short enough to read in a photo.
+    const t = (performance.timeOrigin + now) % 10000;
+    ms.textContent = (t / 1000).toFixed(3).padStart(6, '0');
+    frameEl.textContent = 'frame ' + frame++;
+    square.classList.toggle('on', Math.floor(t / 500) % 2 === 0);
+    requestAnimationFrame(tick);
+  }
+  requestAnimationFrame(tick);
+</script>
+</body>
+</html>

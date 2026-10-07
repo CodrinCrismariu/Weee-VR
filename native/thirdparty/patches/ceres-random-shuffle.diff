@@ -1,0 +1,20 @@
+--- a/internal/ceres/schur_eliminator_impl.h	2026-10-06 23:05:39.625826429 -0400
++++ b/internal/ceres/schur_eliminator_impl.h	2026-10-06 23:05:39.644952808 -0400
+@@ -49,6 +49,7 @@
+ #include "ceres/internal/port.h"
+ 
+ #include <algorithm>
++#include <random>
+ #include <map>
+ 
+ #include "ceres/block_random_access_matrix.h"
+@@ -155,7 +156,8 @@
+ 
+   uneliminated_row_begins_ = chunk.start + chunk.size;
+   if (num_threads_ > 1) {
+-    random_shuffle(chunks_.begin(), chunks_.end());
++    // std::random_shuffle is gone from C++17 libc++.
++    std::shuffle(chunks_.begin(), chunks_.end(), std::mt19937(5489u));
+   }
+ 
+   buffer_.reset(new double[buffer_size_ * num_threads_]);

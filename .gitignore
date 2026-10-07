@@ -1,0 +1,12 @@
+# Fetched by scripts/fetch-xrslam.sh and scripts/hands/fetch-models.py (kept in WSL, mirrored by dev.sh)
+native/WeeeVR/ThirdParty/
+native/WeeeVR/Sources/WeeeVR/HandModels/
+
+# Build output
+.build/
+.swiftpm/
+xtool/
+*.ipa
+
+__pycache__/
+.DS_Store

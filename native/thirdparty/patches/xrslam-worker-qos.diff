@@ -1,0 +1,27 @@
+--- a/xrslam/src/xrslam/utility/worker.h	2026-10-06 23:01:35.372695256 -0400
++++ b/xrslam/src/xrslam/utility/worker.h	2026-10-06 23:01:35.424263548 -0400
+@@ -2,6 +2,9 @@
+ #define XRSLAM_WORKER_H
+ 
+ #include <xrslam/common.h>
++#if defined(__APPLE__)
++#include <pthread.h>
++#endif
+ 
+ namespace xrslam {
+ 
+@@ -14,7 +17,13 @@
+     void start() {
+         worker_running = true;
+ #if defined(XRSLAM_ENABLE_THREADING)
+-        worker_thread = std::thread(&Worker::worker_loop, this);
++        worker_thread = std::thread([this] {
++#if defined(__APPLE__)
++            // Below the render thread (user-interactive), above background work.
++            pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
++#endif
++            worker_loop();
++        });
+ #endif
+     }
+ 
