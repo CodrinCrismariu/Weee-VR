@@ -14,8 +14,11 @@ import simd
 ///   old) advanced to the frame's capture time with the gyro and velocity, then handed to the
 ///   renderer exactly like an ARKit frame pose.
 /// - Continuity: when XRSLAM loses tracking it starts a new map with a new origin and heading. The
-///   new map is re-anchored onto the old one (heading from the gyro, position from the last good
-///   one), so the world doesn't jump. Only a tap (`reset`) moves the origin.
+///   new map is first anchored onto the old one (heading from the gyro, position from the last good
+///   one), so the world doesn't jump. Meanwhile relocalization (`relocQueue`, 4 Hz, utility QoS)
+///   looks for the session's stored keyframes in the camera image; once found, XRSLAMCore reports
+///   the map in the session world and the world snaps back to where it really is (the phone may
+///   have moved while the camera was covered). Only a tap (`reset`) moves the origin.
 final class XRSLAMSource {
     struct Settings: Equatable {
         var timeOffsetMS: Float = 0
@@ -32,30 +35,59 @@ final class XRSLAMSource {
     private static let positionTimeConstant = 0.12   // s: low-pass on XRSLAM position corrections
     private static let positionSnapDistance = 0.5    // m: larger corrections are applied at once
 
+    /// Which world XRSLAM's reported pose is in: a relocalization session's, or (until it relocalizes)
+    /// a new map's own.
+    private enum World: Equatable {
+        case session(UInt64)
+        case map(UInt64)
+    }
+
     private let motion: MotionTracker
     private let queue = DispatchQueue(label: "xrslam.feed", qos: .userInitiated)
     private let imuQueue = OperationQueue()
+    private let relocQueue = DispatchQueue(label: "xrslam.reloc", qos: .utility)
+    private var relocTimer: DispatchSourceTimer?
+    private let relocLock = NSLock()            // a relocalization step never overlaps weee_slam_destroy
+
+    /// Numbers for the diagnostics line, formatted only when it is read (HUD/log, 2×/s), not per frame.
+    private struct Diagnostics {
+        var lagMS = 0
+        var landmarks: Int32 = 0
+        var images: UInt64 = 0
+        var droppedFeeds = 0
+        var attitudeMisses = 0
+        var keyframes: Int32 = 0
+        var relocalizations: Int32 = 0
+    }
 
     // Guarded by `lock`. `slam` is only created/destroyed on `queue`.
     private let lock = NSLock()
     private var slam: OpaquePointer?
+    private var active = false                  // between start and stop: frames may create the tracker
     private var settings = Settings()
     private var feedBusy = false
     private var resetPending = false
     private var _trackingState = "—"
-    private var _info = ""
+    private var diagnostics = Diagnostics()
+    private var _imuInfo = ""
 
     // `queue` only
     private var scaled = [UInt8](repeating: 0, count: XRSLAMSource.width * XRSLAMSource.height)
     private var fedImages = 0
+    private var gyroCount = 0, accelCount = 0
+    private var imuAge = 0.0                    // now - sample timestamp (0 if IMU and camera share a clock)
+    private var imuWindow = CACurrentMediaTime()
 
     // Capture queue only (`process`)
     private var frameCount = 0
     private var droppedFeeds = 0
     private var wasTracking = false
+    private var attitudeMisses = 0              // camera frames with no gyro attitude at their capture time
     private var hadSession = false
-    private var anchorRotation = matrix_identity_double3x3
+    private var anchorRotation = matrix_identity_double3x3      // our world <- `anchorWorld`
     private var anchorTranslation = SIMD3<Double>.zero
+    private var anchorWorld: World?
+    private var sessionAnchor: (id: UInt64, rotation: simd_double3x3, translation: SIMD3<Double>)?
     private var align = matrix_identity_double3x3        // our world <- gyro world (heading only)
     private var alignYaw = 0.0
     private var filteredPosition: SIMD3<Double>?
@@ -79,23 +111,68 @@ final class XRSLAMSource {
     /// One-line tracker diagnostics for the HUD and log.
     var info: String {
         lock.lock()
-        defer { lock.unlock() }
-        return _info
+        let d = diagnostics, imu = _imuInfo
+        lock.unlock()
+        return "slam lag \(d.lagMS) ms · \(d.landmarks) lm · \(d.images) img · drop \(d.droppedFeeds) · \(imu) · att miss \(d.attitudeMisses) · reloc \(d.keyframes) kf \(d.relocalizations)×"
     }
 
     func start(settings: Settings) {
+        lock.lock()
+        active = true
+        lock.unlock()
         configure(settings)
+        relocTimer?.cancel()
         motion.startRawIMU(interval: 0.01, queue: imuQueue, gyro: { [weak self] t, w in
+            self?.countIMU(gyro: true, t)
             guard let slam = self?.slam else { return }
             weee_slam_push_gyro(slam, t, w.x, w.y, w.z)
         }, accel: { [weak self] t, a in
+            self?.countIMU(gyro: false, t)
             guard let slam = self?.slam else { return }
             let g = a * -9.80665                    // CoreMotion g (gravity reads -1) -> m/s², +g up
             weee_slam_push_accel(slam, t, g.x, g.y, g.z)
         })
+        let timer = DispatchSource.makeTimerSource(queue: relocQueue)
+        timer.schedule(deadline: .now() + 0.25, repeating: 0.25, leeway: .milliseconds(50))
+        timer.setEventHandler { [weak self] in self?.relocalizationStep() }
+        timer.resume()
+        relocTimer = timer
+    }
+
+    /// `relocQueue`: keyframe capture while aligned, matching while not (XRSLAMCore). Bounded work:
+    /// < 1 ms when aligned, ~10 ms while relocalizing.
+    private func relocalizationStep() {
+        relocLock.lock()
+        defer { relocLock.unlock() }
+        lock.lock()
+        let slam = self.slam
+        lock.unlock()
+        if let slam { weee_slam_reloc_step(slam) }
+    }
+
+    /// `queue`: IMU rate and timestamp age, for the diagnostics line (catches an OS update changing
+    /// CoreMotion's rate or clock).
+    private func countIMU(gyro: Bool, _ t: Double) {
+        if gyro { gyroCount += 1 } else { accelCount += 1 }
+        let now = CACurrentMediaTime()
+        if gyro { imuAge += ((now - t) - imuAge) * 0.05 }
+        guard now - imuWindow >= 1 else { return }
+        let span = now - imuWindow
+        let text = "imu \(Int((Double(gyroCount) / span).rounded()))/\(Int((Double(accelCount) / span).rounded())) Hz age \(Int((imuAge * 1000).rounded())) ms"
+        gyroCount = 0
+        accelCount = 0
+        imuWindow = now
+        lock.lock()
+        _imuInfo = text
+        lock.unlock()
     }
 
     func stop() {
+        lock.lock()
+        active = false                          // a frame already in flight must not recreate it
+        lock.unlock()
+        relocTimer?.cancel()
+        relocTimer = nil
         motion.stopRawIMU()
         queue.async { [self] in destroy() }
     }
@@ -138,6 +215,8 @@ final class XRSLAMSource {
             wasTracking = false
             anchorRotation = matrix_identity_double3x3
             anchorTranslation = .zero
+            anchorWorld = nil
+            sessionAnchor = nil
             lastGoodPosition = nil
             filteredPosition = nil
             lastFilterTime = 0
@@ -154,6 +233,7 @@ final class XRSLAMSource {
         let now = CACurrentMediaTime()
         let lag = now - state.t
         let attitudeNow = motion.attitude(at: t)
+        if attitudeNow == nil { attitudeMisses += 1 }
         let gyroView = attitudeNow.map { Frames.zUpToYUp * simd_double3x3($0) * Frames.viewToDevice }
         let tracking = state.status == Int32(WEEE_SLAM_TRACKING.rawValue) && state.has_pose != 0
             && lag < Self.maxStaleness
@@ -161,6 +241,7 @@ final class XRSLAMSource {
         var rotation: simd_double3x3
         var position: SIMD3<Double>
         var velocity = SIMD3<Double>.zero
+        var worldChanged = false
         if tracking {
             let q = simd_quatd(ix: state.q_wc.0, iy: state.q_wc.1, iz: state.q_wc.2, r: state.q_wc.3)
             rotation = Frames.zUpToYUp * simd_double3x3(q) * Self.flipYZ
@@ -168,19 +249,34 @@ final class XRSLAMSource {
             velocity = Frames.zUpToYUp * SIMD3(state.v_wb.0, state.v_wb.1, state.v_wb.2)
             let attitudeAtPose = motion.attitude(at: state.t)
 
-            if !wasTracking {
-                // A new XRSLAM map. After a tap it defines the world; after a tracking loss it is
-                // anchored so this pose continues where the old map left off.
-                if hadSession, let lastGood = lastGoodPosition, let a = attitudeAtPose {
+            let world: World = state.aligned != 0 ? .session(state.session_id) : .map(state.map_id)
+            worldChanged = world != anchorWorld
+            if worldChanged {
+                if case .session(let id) = world, let saved = sessionAnchor, saved.id == id {
+                    // Relocalized: the pose is back in the session's world, so is the anchor. The
+                    // world snaps to where it really is.
+                    anchorRotation = saved.rotation
+                    anchorTranslation = saved.translation
+                    Log.info("xrslam: relocalized, world restored")
+                } else if case .session = world, anchorWorld == .map(state.map_id) {
+                    // This map gave up relocalizing and became a new session in its own world:
+                    // the pose didn't change, keep its anchor.
+                } else if hadSession, let lastGood = lastGoodPosition, let a = attitudeAtPose {
+                    // A new map after a tracking loss: continue where the old one left off.
                     let expected = align * Frames.zUpToYUp * simd_double3x3(a) * Frames.viewToDevice
                     anchorRotation = Self.headingOnly(expected * rotation.transpose)
                     anchorTranslation = lastGood - anchorRotation * position
                     Log.info("xrslam: tracking regained, map re-anchored")
                 } else {
+                    // After a tap: this map defines the world.
                     anchorRotation = matrix_identity_double3x3
                     anchorTranslation = .zero
                     Log.info("xrslam: tracking")
                 }
+                if case .session(let id) = world {
+                    sessionAnchor = (id, anchorRotation, anchorTranslation)
+                }
+                anchorWorld = world
                 hadSession = true
             }
             rotation = anchorRotation * rotation
@@ -199,9 +295,10 @@ final class XRSLAMSource {
             // its heading, and position is XRSLAM's low-passed around its own velocity.
             let dt = lastFilterTime > 0 ? min(max(t - lastFilterTime, 0), 0.1) : 0
             lastFilterTime = t
+            let fresh = !wasTracking || worldChanged        // new anchor: filters start over
             if let gyroView {
                 let target = Frames.yaw(of: rotation * gyroView.transpose)
-                if !wasTracking {
+                if fresh {
                     alignYaw = target
                 } else {
                     let error = remainder(target - alignYaw, 2 * .pi)
@@ -210,7 +307,7 @@ final class XRSLAMSource {
                 align = Frames.rotationY(alignYaw)
                 rotation = align * gyroView
             }
-            if !wasTracking || filteredPosition == nil
+            if fresh || filteredPosition == nil
                 || simd_length(position - filteredPosition!) > Self.positionSnapDistance {
                 filteredPosition = position
             } else {
@@ -248,19 +345,18 @@ final class XRSLAMSource {
         if !hasTracker {
             status = "XRSLAM starting…"
         } else if tracking {
-            status = "tracking"
+            status = state.aligned != 0 ? "tracking" : "tracking, looking for known surroundings"
         } else if state.status == Int32(WEEE_SLAM_INITIALIZING.rawValue) {
             status = "move side to side to start"
         } else {
             status = "lost"
         }
-        // Plain interpolation: this runs every camera frame, and a String(format:) type mismatch makes
-        // iOS log an expensive fault each time.
-        let lagMS = tracking ? Int((lag * 1000).rounded()) : 0
-        let info = "slam lag \(lagMS) ms · \(state.landmarks) lm · \(state.images) img · drop \(droppedFeeds)"
+        let d = Diagnostics(lagMS: tracking ? Int((lag * 1000).rounded()) : 0, landmarks: state.landmarks,
+                            images: state.images, droppedFeeds: droppedFeeds, attitudeMisses: attitudeMisses,
+                            keyframes: state.keyframes, relocalizations: state.relocalizations)
         lock.lock()
         _trackingState = status
-        _info = info
+        diagnostics = d
         lock.unlock()
     }
 
@@ -283,7 +379,10 @@ final class XRSLAMSource {
                 feedBusy = false
                 lock.unlock()
             }
-            if slam == nil { create(intrinsics: k, size: size) }
+            lock.lock()
+            let active = self.active
+            lock.unlock()
+            if slam == nil, active { create(intrinsics: k, size: size) }
             guard let slam, downscaleLuma(buffer) else { return }
             scaled.withUnsafeBufferPointer {
                 weee_slam_push_image(slam, time, $0.baseAddress, Int32(Self.width), Int32(Self.height), Int32(Self.width))
@@ -342,7 +441,11 @@ final class XRSLAMSource {
         let old = slam
         slam = nil
         lock.unlock()
-        if let old { weee_slam_destroy(old) }
+        if let old {
+            relocLock.lock()                    // waits out a relocalization step using it
+            weee_slam_destroy(old)
+            relocLock.unlock()
+        }
         fedImages = 0
     }
 

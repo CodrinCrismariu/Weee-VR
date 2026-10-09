@@ -1,0 +1,509 @@
+diff --git a/xrslam/include/xrslam/xrslam.h b/xrslam/include/xrslam/xrslam.h
+index 4534d13..dbd644f 100644
+--- a/xrslam/include/xrslam/xrslam.h
++++ b/xrslam/include/xrslam/xrslam.h
+@@ -121,6 +121,14 @@ class Config {
+     virtual double solver_time_limit() const;
+ 
+     virtual double rotation_misalignment_threshold() const;
++    virtual double stationary_max_angular_rate() const;        // rad/s
++    virtual double stationary_max_acceleration_change() const; // m/s^2
++    virtual double stationary_velocity_sigma() const;          // m/s
++    virtual double stationary_position_sigma() const;          // m per frame
++    virtual size_t tracking_min_landmarks() const;   // triangulated landmarks seen by the newest frame
++    virtual double tracking_loss_time() const;       // s below that while moving = lost
++    virtual double initializer_min_acceleration() const; // m/s^2, rms linear acceleration
++    virtual double initializer_short_window() const; // s, every other attempt, for fast motion
+     virtual double rotation_ransac_threshold() const;
+ 
+     virtual int random() const;
+diff --git a/xrslam/src/xrslam/config.cpp b/xrslam/src/xrslam/config.cpp
+index 8057697..27a7776 100644
+--- a/xrslam/src/xrslam/config.cpp
++++ b/xrslam/src/xrslam/config.cpp
+@@ -61,6 +61,22 @@ double Config::solver_time_limit() const { return 1.0e6; }
+ 
+ double Config::rotation_misalignment_threshold() const { return 0.1; }
+ 
++double Config::stationary_max_angular_rate() const { return 0.1; }
++
++double Config::stationary_max_acceleration_change() const { return 0.3; }
++
++double Config::stationary_velocity_sigma() const { return 0.01; }
++
++double Config::stationary_position_sigma() const { return 0.002; }
++
++size_t Config::tracking_min_landmarks() const { return 10; }
++
++double Config::tracking_loss_time() const { return 0.5; }
++
++double Config::initializer_min_acceleration() const { return 0.2; }
++
++double Config::initializer_short_window() const { return 0.45; }
++
+ double Config::rotation_ransac_threshold() const { return 10; }
+ 
+ int Config::random() const { return 648; }
+diff --git a/xrslam/src/xrslam/core/initializer.cpp b/xrslam/src/xrslam/core/initializer.cpp
+index 48cf820..2563bac 100644
+--- a/xrslam/src/xrslam/core/initializer.cpp
++++ b/xrslam/src/xrslam/core/initializer.cpp
+@@ -24,6 +24,15 @@ void Initializer::mirror_keyframe_map(Map *feature_tracking_map,
+     size_t init_frame_index_last =
+         feature_tracking_map->frame_index_by_id(init_frame_id);
+     size_t init_frame_index_gap = config->initializer_keyframe_gap();
++    if (attempt++ % 2 && init_frame_index_last != nil() && init_frame_index_last >= 10) {
++        // Frame gap giving a window of initializer_short_window() at the current frame rate.
++        double dt = (feature_tracking_map->get_frame(init_frame_index_last)->image->t -
++                     feature_tracking_map->get_frame(init_frame_index_last - 10)->image->t) /
++                    10.0;
++        double frames = config->initializer_short_window() /
++                        (dt * double(config->initializer_keyframe_num() - 1));
++        init_frame_index_gap = std::max<size_t>(1, size_t(std::lround(frames)));
++    }
+     size_t init_frame_index_distance =
+         init_frame_index_gap * (config->initializer_keyframe_num() - 1);
+ 
+@@ -78,9 +87,15 @@ void Initializer::mirror_keyframe_map(Map *feature_tracking_map,
+ std::unique_ptr<SlidingWindowTracker> Initializer::initialize() {
+     if (!map)
+         return nullptr;
+-    if (!init_sfm())
+-        return nullptr;
+-    if (!init_imu())
++    double motion = acceleration_rms();
++    bool moving = motion >= config->initializer_min_acceleration();
++    bool sfm = moving && init_sfm();
++    bool imu = sfm && init_imu();
++#ifdef XRSLAM_REPLAY_TRACE
++    fprintf(stderr, "INIT t=%.3f accel_rms=%.3f moving=%d sfm=%d imu=%d\n",
++            map->get_frame(map->frame_num() - 1)->image->t, motion, int(moving), int(sfm), int(imu));
++#endif
++    if (!imu)
+         return nullptr;
+ 
+     map->get_frame(0)->tag(FT_FIX_POSE) = true;
+@@ -188,6 +203,10 @@ bool Initializer::init_sfm() {
+         common_track_num++;
+     }
+ 
++#ifdef XRSLAM_REPLAY_TRACE
++    fprintf(stderr, "SFM matches=%d parallax=%.1f\n", common_track_num,
++            total_parallax / std::max(common_track_num, 1));
++#endif
+     if (common_track_num < (int)config->initializer_min_matches())
+         return false;
+     total_parallax /= std::max(common_track_num, 1);
+@@ -382,6 +401,47 @@ bool Initializer::init_sfm() {
+     return true;
+ }
+ 
++double Initializer::acceleration_rms() const {
++    // Accelerometer samples rotated into the first sample's frame with the integrated gyro: gravity
++    // becomes a constant there, so their spread is the linear acceleration (plus noise).
++    std::vector<vector<3>> accelerations;
++    quaternion q = quaternion::Identity();
++    double last_t = -1;
++    for (size_t i = 1; i < map->frame_num(); ++i) {
++        for (const ImuData &imu : map->get_frame(i)->preintegration.data) {
++            if (last_t >= 0 && imu.t > last_t) {
++                vector<3> angle = imu.w * (imu.t - last_t);
++                if (angle.norm() > 1e-12) {
++                    q = (q * quaternion(Eigen::AngleAxisd(angle.norm(), angle.normalized())))
++                            .normalized();
++                }
++            }
++            last_t = imu.t;
++            accelerations.push_back(q * imu.a);
++        }
++    }
++    if (accelerations.size() < 10)
++        return 0;
++    // Least-squares line per axis over the sample index; the residual is the motion.
++    const double n = double(accelerations.size());
++    double sx = 0, sxx = 0;
++    vector<3> sy = vector<3>::Zero(), sxy = vector<3>::Zero();
++    for (size_t i = 0; i < accelerations.size(); ++i) {
++        double x = double(i);
++        sx += x;
++        sxx += x * x;
++        sy += accelerations[i];
++        sxy += x * accelerations[i];
++    }
++    vector<3> slope = (n * sxy - sx * sy) / (n * sxx - sx * sx);
++    vector<3> offset = (sy - slope * sx) / n;
++    double variance = 0;
++    for (size_t i = 0; i < accelerations.size(); ++i) {
++        variance += (accelerations[i] - offset - slope * double(i)).squaredNorm();
++    }
++    return std::sqrt(variance / n);
++}
++
+ bool Initializer::init_imu() {
+     reset_states();
+     solve_gyro_bias();
+diff --git a/xrslam/src/xrslam/core/initializer.h b/xrslam/src/xrslam/core/initializer.h
+index aff6b11..8e54284 100644
+--- a/xrslam/src/xrslam/core/initializer.h
++++ b/xrslam/src/xrslam/core/initializer.h
+@@ -22,6 +22,9 @@ class Initializer {
+   private:
+     bool init_sfm();
+     bool init_imu();
++    double acceleration_rms() const; // m/s^2, gravity removed
++
++    size_t attempt = 0; // alternates the normal and the short initialization window
+ 
+     void solve_gyro_bias();
+     void solve_gravity_scale_velocity();
+diff --git a/xrslam/src/xrslam/core/sliding_window_tracker.cpp b/xrslam/src/xrslam/core/sliding_window_tracker.cpp
+index 547fecf..1f3eeab 100644
+--- a/xrslam/src/xrslam/core/sliding_window_tracker.cpp
++++ b/xrslam/src/xrslam/core/sliding_window_tracker.cpp
+@@ -89,13 +89,33 @@ bool SlidingWindowTracker::track() {
+ 
+     localize_newframe();
+ 
+-    if (manage_keyframe()) {
++    bool keyframe_added = manage_keyframe();
++    if (keyframe_added) {
+         track_landmark();
+         refine_window();
+         slide_window();
+     } else {
+         refine_subwindow();
+     }
++#ifdef XRSLAM_REPLAY_TRACE
++    { // Offline replay only (scripts/replay): window bookkeeping per tracked frame.
++        Frame *last = map->get_frame(map->frame_num() - 1);
++        Frame *newest = last->subframes.empty() ? last : last->subframes.back().get();
++        size_t valid = 0;
++        for (size_t i = 0; i < map->track_num(); ++i)
++            if (Track *track = map->get_track(i))
++                if (track->all_tagged(TT_VALID, TT_TRIANGULATED))
++                    valid++;
++        fprintf(stderr,
++                "TRACE t=%.3f kf=%d notrans=%d still=%d frames=%zu subframes=%zu "
++                "tracks=%zu tri=%zu v=%.3f\n",
++                newest->image->t, int(keyframe_added),
++                int(newest->tag(FT_NO_TRANSLATION)),
++                int(newest->tag(FT_STATIONARY)), map->frame_num(),
++                last->subframes.size(), map->track_num(), valid,
++                newest->motion.v.norm());
++    }
++#endif
+ 
+     inspect_debug(sliding_window_landmarks, landmarks) {
+         std::vector<Landmark> points;
+@@ -113,6 +133,32 @@ bool SlidingWindowTracker::track() {
+         landmarks = std::move(points);
+     }
+ 
++    return has_visual_support();
++}
++
++bool SlidingWindowTracker::has_visual_support() {
++    Frame *last = map->get_frame(map->frame_num() - 1);
++    Frame *newest = last->subframes.empty() ? last : last->subframes.back().get();
++    size_t seen = 0;
++    for (size_t k = 0; k < newest->keypoint_num(); ++k) {
++        if (Track *track = newest->get_track(k)) {
++            if (track->all_tagged(TT_VALID, TT_TRIANGULATED)) {
++                seen++;
++            }
++        }
++    }
++    double t = newest->image->t;
++    if (visual_support_time < 0 || seen >= config->tracking_min_landmarks() ||
++        newest->tag(FT_STATIONARY)) {
++        // Stationary frames are held by the zero-velocity factor even without landmarks.
++        visual_support_time = t;
++        return true;
++    }
++    if (t - visual_support_time > config->tracking_loss_time()) {
++        log_message(XRSLAM_LOG_INFO, "tracking lost: %zu landmarks for %.2f s, reinitializing",
++                    seen, t - visual_support_time);
++        return false;
++    }
+     return true;
+ }
+ 
+@@ -129,6 +175,8 @@ void SlidingWindowTracker::localize_newframe() {
+ 
+     solver->put_factor(Solver::create_preintegration_prior_factor(
+         frame_i, frame_j, frame_j->preintegration));
++    solver->put_zero_velocity_factor(frame_j);
++    solver->put_no_motion_factor(frame_i, frame_j);
+ 
+     for (size_t k = 0; k < frame_j->keypoint_num(); ++k) {
+         if (Track *track = frame_j->get_track(k)) {
+@@ -206,7 +254,8 @@ bool SlidingWindowTracker::manage_keyframe() {
+     }
+ 
+     bool is_keyframe = mapped_landmark_count <
+-                       config->sliding_window_force_keyframe_landmarks();
++                           config->sliding_window_force_keyframe_landmarks() &&
++                       !newframe_j->tag(FT_STATIONARY);
+ 
+ #if defined(XRSLAM_IOS)
+     is_keyframe = is_keyframe || !newframe_j->tag(FT_NO_TRANSLATION);
+@@ -279,6 +328,12 @@ void SlidingWindowTracker::refine_window() {
+ 
+     solver->add_factor(map->marginalization_factor.get());
+ 
++    for (size_t i = 0; i < map->frame_num(); ++i) {
++        solver->put_zero_velocity_factor(map->get_frame(i));
++        if (i > 0)
++            solver->put_no_motion_factor(map->get_frame(i - 1), map->get_frame(i));
++    }
++
+     for (size_t i = 0; i < map->frame_num(); ++i) {
+         Frame *frame = map->get_frame(i);
+         for (size_t j = 0; j < frame->keypoint_num(); ++j) {
+@@ -405,6 +460,8 @@ void SlidingWindowTracker::refine_subwindow() {
+                 prev_frame->motion.ba, true, true);
+             solver->put_factor(Solver::create_preintegration_error_factor(
+                 prev_frame, subframe, subframe->preintegration));
++            solver->put_zero_velocity_factor(subframe);
++            solver->put_no_motion_factor(prev_frame, subframe);
+         }
+ 
+         Frame *last_subframe = frame->subframes.back().get();
+@@ -442,6 +499,8 @@ void SlidingWindowTracker::refine_subwindow() {
+                 prev_frame->motion.ba, true, true);
+             solver->put_factor(Solver::create_preintegration_error_factor(
+                 prev_frame, subframe, subframe->preintegration));
++            solver->put_zero_velocity_factor(subframe);
++            solver->put_no_motion_factor(prev_frame, subframe);
+             for (size_t k = 0; k < subframe->keypoint_num(); ++k) {
+                 if (Track *track = subframe->get_track(k)) {
+                     if (track->all_tagged(TT_VALID, TT_TRIANGULATED,
+diff --git a/xrslam/src/xrslam/core/sliding_window_tracker.h b/xrslam/src/xrslam/core/sliding_window_tracker.h
+index 14bbf81..a3e56a7 100644
+--- a/xrslam/src/xrslam/core/sliding_window_tracker.h
++++ b/xrslam/src/xrslam/core/sliding_window_tracker.h
+@@ -25,6 +25,9 @@ class SlidingWindowTracker {
+     bool manage_keyframe();
+ 
+     void refine_subwindow();
++    bool has_visual_support();
++
++    double visual_support_time = -1; // last time the newest frame saw enough landmarks
+ 
+     bool judge_track_status();
+     void fuse_imu_track();
+diff --git a/xrslam/src/xrslam/estimation/ceres/zero_velocity_factor.h b/xrslam/src/xrslam/estimation/ceres/zero_velocity_factor.h
+new file mode 100644
+index 0000000..49829f6
+--- /dev/null
++++ b/xrslam/src/xrslam/estimation/ceres/zero_velocity_factor.h
+@@ -0,0 +1,87 @@
++#ifndef XRSLAM_CERES_ZERO_VELOCITY_FACTOR_H
++#define XRSLAM_CERES_ZERO_VELOCITY_FACTOR_H
++
++#include <xrslam/common.h>
++
++namespace xrslam {
++
++// Zero-velocity update for a stationary frame: r = v / sigma. Without it a monocular VIO that
++// stands still has no translation to triangulate from, and its velocity is left to the
++// accelerometer bias, which integrates into a position that runs away.
++class CeresZeroVelocityFactor : public ceres::SizedCostFunction<3, 3> {
++  public:
++    explicit CeresZeroVelocityFactor(double sigma) : inv_sigma(1.0 / sigma) {}
++
++    bool Evaluate(const double *const *parameters, double *residuals,
++                  double **jacobians) const override {
++        const_map<vector<3>> v(parameters[0]);
++        map<vector<3>> r(residuals);
++        r = v * inv_sigma;
++        if (jacobians && jacobians[0]) {
++            map<matrix<3, 3, true>> dr_dv(jacobians[0]);
++            dr_dv = matrix<3>::Identity() * inv_sigma;
++        }
++        return true;
++    }
++
++  private:
++    double inv_sigma;
++};
++
++// No-motion update between two consecutive frames when the later one is stationary:
++// r = (p_j - p_i) / sigma. The zero-velocity factor alone still lets position drift: XRSLAM chains
++// still frames into long IMU preintegrations, and an accelerometer bias over many seconds integrates
++// into metres even with both end velocities at zero.
++class CeresNoMotionFactor : public ceres::SizedCostFunction<3, 3, 3> {
++  public:
++    explicit CeresNoMotionFactor(double sigma) : inv_sigma(1.0 / sigma) {}
++
++    bool Evaluate(const double *const *parameters, double *residuals,
++                  double **jacobians) const override {
++        const_map<vector<3>> p_i(parameters[0]);
++        const_map<vector<3>> p_j(parameters[1]);
++        map<vector<3>> r(residuals);
++        r = (p_j - p_i) * inv_sigma;
++        if (jacobians) {
++            if (jacobians[0]) {
++                map<matrix<3, 3, true>> dr_dpi(jacobians[0]);
++                dr_dpi = -matrix<3>::Identity() * inv_sigma;
++            }
++            if (jacobians[1]) {
++                map<matrix<3, 3, true>> dr_dpj(jacobians[1]);
++                dr_dpj = matrix<3>::Identity() * inv_sigma;
++            }
++        }
++        return true;
++    }
++
++  private:
++    double inv_sigma;
++};
++
++// The same when frame_i is not a state of the problem: its position is a constant.
++class CeresPositionPriorFactor : public ceres::SizedCostFunction<3, 3> {
++  public:
++    CeresPositionPriorFactor(const vector<3> &p_i, double sigma)
++        : p_i(p_i), inv_sigma(1.0 / sigma) {}
++
++    bool Evaluate(const double *const *parameters, double *residuals,
++                  double **jacobians) const override {
++        const_map<vector<3>> p_j(parameters[0]);
++        map<vector<3>> r(residuals);
++        r = (p_j - p_i) * inv_sigma;
++        if (jacobians && jacobians[0]) {
++            map<matrix<3, 3, true>> dr_dpj(jacobians[0]);
++            dr_dpj = matrix<3>::Identity() * inv_sigma;
++        }
++        return true;
++    }
++
++  private:
++    vector<3> p_i;
++    double inv_sigma;
++};
++
++} // namespace xrslam
++
++#endif // XRSLAM_CERES_ZERO_VELOCITY_FACTOR_H
+diff --git a/xrslam/src/xrslam/estimation/solver.cpp b/xrslam/src/xrslam/estimation/solver.cpp
+index fe93a46..d6b6925 100644
+--- a/xrslam/src/xrslam/estimation/solver.cpp
++++ b/xrslam/src/xrslam/estimation/solver.cpp
+@@ -5,6 +5,7 @@
+ #include <xrslam/estimation/ceres/reprojection_factor.h>
+ #include <xrslam/estimation/ceres/rotation_factor.h>
+ #include <xrslam/estimation/solver.h>
++#include <xrslam/estimation/ceres/zero_velocity_factor.h>
+ #include <xrslam/estimation/state.h>
+ #include <xrslam/map/frame.h>
+ 
+@@ -24,6 +25,7 @@ struct Solver::SolverDetails {
+     std::vector<std::unique_ptr<PreIntegrationErrorFactor>> managed_piefactors;
+     std::vector<std::unique_ptr<PreIntegrationPriorFactor>> managed_pipfactors;
+     std::vector<std::unique_ptr<MarginalizationFactor>> managed_marfactors;
++    std::vector<std::unique_ptr<ceres::CostFunction>> managed_zvfactors;
+ };
+ 
+ Solver::Solver() : details(std::make_unique<SolverDetails>()) {
+@@ -173,6 +175,34 @@ void Solver::add_factor(MarginalizationFactor *factor) {
+         static_cast<CeresMarginalizationFactor *>(factor), nullptr, params);
+ }
+ 
++void Solver::put_zero_velocity_factor(Frame *frame) {
++    if (!frame->tag(FT_STATIONARY) || frame->tag(FT_FIX_MOTION))
++        return;
++    auto factor = std::make_unique<CeresZeroVelocityFactor>(
++        SolverDetails::config()->stationary_velocity_sigma());
++    details->problem->AddResidualBlock(factor.get(), nullptr,
++                                       frame->motion.v.data());
++    details->managed_zvfactors.emplace_back(std::move(factor));
++}
++
++void Solver::put_no_motion_factor(Frame *frame_i, Frame *frame_j) {
++    if (!frame_j->tag(FT_STATIONARY))
++        return;
++    if (frame_i->tag(FT_FIX_POSE) && frame_j->tag(FT_FIX_POSE))
++        return;
++    const double sigma = SolverDetails::config()->stationary_position_sigma();
++    std::unique_ptr<ceres::CostFunction> factor;
++    if (details->problem->HasParameterBlock(frame_i->pose.p.data())) {
++        factor = std::make_unique<CeresNoMotionFactor>(sigma);
++        details->problem->AddResidualBlock(factor.get(), nullptr, frame_i->pose.p.data(),
++                                           frame_j->pose.p.data());
++    } else {
++        factor = std::make_unique<CeresPositionPriorFactor>(frame_i->pose.p, sigma);
++        details->problem->AddResidualBlock(factor.get(), nullptr, frame_j->pose.p.data());
++    }
++    details->managed_zvfactors.emplace_back(std::move(factor));
++}
++
+ bool Solver::solve(bool verbose) {
+     ceres::Solver::Options solver_options;
+     ceres::Solver::Summary solver_summary;
+diff --git a/xrslam/src/xrslam/estimation/solver.h b/xrslam/src/xrslam/estimation/solver.h
+index f1197b5..d76d941 100644
+--- a/xrslam/src/xrslam/estimation/solver.h
++++ b/xrslam/src/xrslam/estimation/solver.h
+@@ -49,6 +49,12 @@ class Solver {
+     virtual void add_factor(PreIntegrationPriorFactor *pipcost);
+     virtual void add_factor(MarginalizationFactor *marcost);
+ 
++    // Zero velocity for `frame` when it is tagged FT_STATIONARY (its motion states must be added).
++    void put_zero_velocity_factor(Frame *frame);
++    // Zero position change from frame_i to frame_j when frame_j is tagged FT_STATIONARY (both
++    // frames' pose states must be added).
++    void put_no_motion_factor(Frame *frame_i, Frame *frame_j);
++
+     template <typename T> void put_factor(std::unique_ptr<T> &&factor) {
+         add_factor(factor.get());
+         manage_factor(std::move(factor));
+diff --git a/xrslam/src/xrslam/map/frame.cpp b/xrslam/src/xrslam/map/frame.cpp
+index 3fb3821..f8dd5e1 100644
+--- a/xrslam/src/xrslam/map/frame.cpp
++++ b/xrslam/src/xrslam/map/frame.cpp
+@@ -131,6 +131,31 @@ void Frame::track_keypoints(Frame *next_frame, Config *config) {
+     }
+     if (misalignment < config->rotation_misalignment_threshold()) {
+         next_frame->tag(FT_NO_TRANSLATION) = true;
++        // Stationary: also no rotation and no change in acceleration over the IMU samples of the
++        // last two frame intervals. The visual test alone also passes for a camera translating past
++        // far scenery (walking in a large space).
++        std::vector<const ImuData *> samples;
++        for (const auto &imu : preintegration.data)
++            samples.push_back(&imu);
++        for (const auto &imu : next_frame->preintegration.data)
++            samples.push_back(&imu);
++        if (samples.size() >= 4) {
++            vector<3> mean_a = vector<3>::Zero();
++            double max_w = 0;
++            for (const ImuData *imu : samples) {
++                mean_a += imu->a;
++                max_w = std::max(max_w, imu->w.norm());
++            }
++            mean_a /= double(samples.size());
++            double max_da = 0;
++            for (const ImuData *imu : samples) {
++                max_da = std::max(max_da, (imu->a - mean_a).norm());
++            }
++            if (max_w < config->stationary_max_angular_rate() &&
++                max_da < config->stationary_max_acceleration_change()) {
++                next_frame->tag(FT_STATIONARY) = true;
++            }
++        }
+     }
+ 
+     // filter keypoints based on track length
+diff --git a/xrslam/src/xrslam/map/frame.h b/xrslam/src/xrslam/map/frame.h
+index 3b03142..7b6d683 100644
+--- a/xrslam/src/xrslam/map/frame.h
++++ b/xrslam/src/xrslam/map/frame.h
+@@ -18,7 +18,8 @@ enum FrameTag : int {
+     FT_KEYFRAME = 0,
+     FT_NO_TRANSLATION,
+     FT_FIX_POSE,
+-    FT_FIX_MOTION
++    FT_FIX_MOTION,
++    FT_STATIONARY // no visual translation and a still IMU: zero-velocity factor
+ };
+ 
+ class Frame : public Tagged<FrameTag>, public Identifiable<Frame> {

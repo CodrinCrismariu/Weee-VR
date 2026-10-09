@@ -7,6 +7,9 @@ MediaPipe Hand, converted to Core ML; Apache-2.0 upstream). Those packages compu
 Core ML can only run on the CPU or GPU; recompiling the same program with FP16 compute precision
 lets it run on the Neural Engine, keeping the GPU free for rendering. Inputs/outputs stay FP32.
 Writes <out-dir>/HandDetector.mlpackage and <out-dir>/HandLandmarks.mlpackage.
+
+The app now uses Google's newer (2023) landmark model instead of this HandLandmarks: run
+convert-landmarker.py <out-dir> afterwards to replace it (keep this one's palm detector).
 """
 import shutil
 import sys

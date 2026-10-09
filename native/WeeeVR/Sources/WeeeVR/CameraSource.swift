@@ -18,9 +18,34 @@ struct CameraFrame {
     var velocity = SIMD3<Float>.zero    // camera velocity (m/s, world), smoothed
     var trackingNormal = false          // the 6DoF tracker has a good position
     var proxyDepth: Float?              // auto depth-proxy distance from the tracker's feature points (m)
+    var ycbcrMatrix: Float = 0          // the buffer's YCbCr -> RGB matrix: 0 BT.601, 1 BT.709
+    var needsP3Conversion = true        // sRGB/BT.709 primaries (not already P3) on the P3 screen
 
     var lumaTexture: MTLTexture? { CVMetalTextureGetTexture(luma) }
     var chromaTexture: MTLTexture? { CVMetalTextureGetTexture(chroma) }
+
+    /// The matrix `buffer` is tagged with (HD camera video: BT.709); untagged counts as BT.601.
+    static func ycbcrMatrix(of buffer: CVPixelBuffer) -> Float {
+        guard let value = CVBufferCopyAttachment(buffer, kCVImageBufferYCbCrMatrixKey, nil) else { return 0 }
+        return CFEqual(value, kCVImageBufferYCbCrMatrix_ITU_R_709_2) ? 1 : 0
+    }
+
+    /// Whether `buffer`'s colour primaries still need converting for the P3 screen: everything except
+    /// P3 (untagged counts as sRGB/BT.709).
+    static func needsP3Conversion(_ buffer: CVPixelBuffer) -> Bool {
+        guard let value = CVBufferCopyAttachment(buffer, kCVImageBufferColorPrimariesKey, nil) else { return true }
+        return !CFEqual(value, kCVImageBufferColorPrimaries_P3_D65)
+    }
+
+    /// The buffer's colour tags (matrix, primaries, transfer function), for the log.
+    static func colorDescription(of buffer: CVPixelBuffer) -> String {
+        func tag(_ key: CFString) -> String {
+            guard let value = CVBufferCopyAttachment(buffer, key, nil) else { return "none" }
+            return (value as? String) ?? "\(value)"
+        }
+        return "matrix \(tag(kCVImageBufferYCbCrMatrixKey)), primaries \(tag(kCVImageBufferColorPrimariesKey)), "
+            + "transfer \(tag(kCVImageBufferTransferFunctionKey))"
+    }
 }
 
 /// Latest-frame-wins handoff from the camera thread to the render thread.

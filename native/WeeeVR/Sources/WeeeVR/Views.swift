@@ -43,6 +43,36 @@ struct CalibrationView: View {
                 } footer: {
                     Text("Point the back camera at the grid on the laptop screen. 3 s countdown, then 75 s: first slowly move the grid through every part of the view, then tilt, turn and shift the phone in all directions while keeping the grid in view.")
                 }
+                Section {
+                    Picker("Scene (placed on tap)", selection: $model.viewer.scene) {
+                        ForEach(GameScene.allCases, id: \.self) { Text($0.label).tag($0) }
+                    }
+                    SliderRow(title: "Table below eyes", value: $model.viewer.tableDropM, range: 0.35...1.0, format: "%.2f m")
+                    SliderRow(title: "Assist", value: $model.viewer.assist, range: 0...1, format: "%.0f%%", scale: 100)
+                    Toggle("Floating serve ball", isOn: $model.viewer.floatingServe)
+                    SliderRow(title: "Opponent level", value: $model.viewer.opponentLevel, range: 0...1, format: "%.2f")
+                    SliderRow(title: "Sound volume", value: $model.viewer.gameVolume, range: 0...1, format: "%.2f")
+                    SliderRow(title: "Hand prediction", value: $model.viewer.paddlePrediction, range: 0...0.12, format: "%.3f s")
+                    SliderRow(title: "Paddle grip angle", value: $model.viewer.gripAngleDeg, range: 0...80, format: "%.0f°")
+                    SliderRow(title: "Paddle grip offset", value: $model.viewer.gripOffsetMM, range: -40...20, format: "%.0f mm")
+                    Toggle("Short exposure (sharper fast hands)", isOn: $model.viewer.shortExposure)
+                } header: {
+                    Text("Game")
+                } footer: {
+                    Text("Tap places the table ahead of you. Pinch the ball (thumb + index) with your left hand to pick it up, open to toss; the paddle is in your right hand. Assist: a bigger hit zone, shots steered onto the table, a slower ball, a clean toss and friendlier returns (0% = realistic). Table height: standing ~0.8 m below the eyes, seated ~0.45 m.")
+                }
+                Section {
+                    Toggle("Accurate colour (BT.709 + P3)", isOn: $model.viewer.accurateColor)
+                    SliderRow(title: "Sharpening", value: $model.viewer.sharpening, range: 0...1, format: "%.2f")
+                    SliderRow(title: "Lens colour fringe fix", value: $model.viewer.chromaticAberration, range: -0.03...0.03, format: "%+.3f")
+                    SliderRow(title: "Black lift", value: $model.viewer.blackLift, range: 0...0.06, format: "%.3f")
+                    SliderRow(title: "Lens edge softness", value: $model.viewer.edgeSoftness, range: 0...0.3, format: "%.2f")
+                    Toggle("Full brightness in VR", isOn: $model.viewer.maxBrightness)
+                } header: {
+                    Text("Image")
+                } footer: {
+                    Text("Fringe fix: look at a sharp dark/bright edge near the rim of a lens and slide until its red and blue fringes disappear.")
+                }
                 Section("Hands") {
                     Toggle("Hand tracking", isOn: $model.viewer.handTracking)
                     Toggle("Show 3D hands", isOn: $model.viewer.handOverlay)
@@ -68,7 +98,6 @@ struct CalibrationView: View {
                     SliderRow(title: "FOV scale (1 = life-size)", value: $model.viewer.fovScale, range: 0.5...2.0, format: "%.2f")
                     Toggle("Flip camera 180°", isOn: $model.viewer.flipCamera)
                     Toggle("World grid", isOn: $model.viewer.showGrid)
-                    Toggle("Test cube", isOn: $model.viewer.showCube)
                 }
                 Section("Cardboard lenses") {
                     SliderRow(title: "Distortion k1", value: $model.viewer.k1, range: -0.2...1.0, format: "%.3f")
@@ -101,13 +130,14 @@ private struct SliderRow: View {
     @Binding var value: Float
     let range: ClosedRange<Float>
     let format: String
+    var scale: Float = 1                // shown value = value * scale (e.g. 100 for percent)
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
             HStack {
                 Text(title)
                 Spacer()
-                Text(String(format: format, value)).monospacedDigit().foregroundStyle(.secondary)
+                Text(String(format: format, value * scale)).monospacedDigit().foregroundStyle(.secondary)
             }
             Slider(value: $value, in: range)
         }

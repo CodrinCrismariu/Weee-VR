@@ -143,6 +143,8 @@ final class ARKitSource: NSObject, ARSessionDelegate {
         f.velocity = velocity
         f.trackingNormal = normal
         f.proxyDepth = depth
+        f.ycbcrMatrix = CameraFrame.ycbcrMatrix(of: buffer)
+        f.needsP3Conversion = CameraFrame.needsP3Conversion(buffer)
         mailbox.put(f)
         onFrame?(f)
     }

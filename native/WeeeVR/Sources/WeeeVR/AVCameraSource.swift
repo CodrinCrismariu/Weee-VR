@@ -46,6 +46,7 @@ final class AVCameraSource: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
     private var fallbackIntrinsics = SIMD4<Float>(1, 1, 0, 0)  // from the format's FOV
     private var horizontalFov: Float = 0
     private var _usingAttachedIntrinsics = false
+    private var loggedMatrix = false                            // once per configuration
 
     var onStatus: ((String) -> Void)?
     private var _frameHook: ((inout CameraFrame) -> Void)?
@@ -110,6 +111,21 @@ final class AVCameraSource: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
         }
     }
 
+    /// Game: auto exposure kept, but never longer than `maxSeconds` (ISO rises instead), so fast hands
+    /// blur less; `nil` lifts the cap.
+    func capExposure(to maxSeconds: Double?) {
+        sessionQueue.async { [self] in
+            guard let device = (session.inputs.first as? AVCaptureDeviceInput)?.device,
+                  (try? device.lockForConfiguration()) != nil else { return }
+            defer { device.unlockForConfiguration() }
+            if device.isExposureModeSupported(.continuousAutoExposure) { device.exposureMode = .continuousAutoExposure }
+            let format = device.activeFormat
+            let cap = maxSeconds.map { max($0, format.minExposureDuration.seconds) }
+            device.activeMaxExposureDuration = cap.map { CMTime(seconds: $0, preferredTimescale: 1_000_000) } ?? .invalid
+            Log.info("camera: exposure cap \(cap.map { "\(Int(($0 * 1000).rounded())) ms" } ?? "off")")
+        }
+    }
+
     private func configure(lens: Lens, preset: Preset) throws -> String {
         guard let device = AVCaptureDevice.default(lens.deviceType, for: .video, position: .back) else {
             throw CameraError("\(lens.rawValue) camera not available")
@@ -169,6 +185,7 @@ final class AVCameraSource: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
         lock.lock()
         fallbackIntrinsics = SIMD4(fx, fx, Float(dims.width) / 2, Float(dims.height) / 2)
         horizontalFov = hfov
+        loggedMatrix = false
         lock.unlock()
 
         Log.info(String(format: "camera: %@ %dx%d@%d hfov=%.1f (uncorrected %.1f) gdc=%@ binned=%@", lens.rawValue,
@@ -251,10 +268,15 @@ final class AVCameraSource: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
         lock.lock()
         _usingAttachedIntrinsics = attached
         let hook = _frameHook
+        let logMatrix = !loggedMatrix
+        loggedMatrix = true
         lock.unlock()
+        if logMatrix { Log.info("camera: colour \(CameraFrame.colorDescription(of: buffer))") }
 
         var frame = CameraFrame(pixelBuffer: buffer, luma: luma, chroma: chroma, size: SIMD2(width, height),
                                 intrinsics: intrinsics, captureTime: captureTime, arrivalTime: arrival, pose: nil)
+        frame.ycbcrMatrix = CameraFrame.ycbcrMatrix(of: buffer)
+        frame.needsP3Conversion = CameraFrame.needsP3Conversion(buffer)
         hook?(&frame)
         mailbox.put(frame)
     }

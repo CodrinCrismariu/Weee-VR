@@ -53,10 +53,29 @@ struct ViewerProfile: Codable, Equatable {
     var handOverlay = true              // draw the tracked 3D hands
     var handScale: Float = 1            // hand size relative to an average adult (sets bone thickness)
 
+    // Image (all in the passthrough shader; none of it reaches the trackers)
+    var accurateColor = true            // camera's own YCbCr matrix (BT.709) + sRGB -> P3 for the screen
+    var chromaticAberration: Float = 0  // lens colour fringes: red sampled at 1 - c, blue at 1 + c
+    var sharpening: Float = 0.35        // bicubic + adaptive unsharp on the camera image (0 = bilinear)
+    var blackLift: Float = 0.02         // keeps OLED pixels off pure black: less smear in dark areas
+    var edgeSoftness: Float = 0.12      // fraction of the lens radius fading to black at its edge
+    var maxBrightness = true            // screen at full brightness while the VR view is up
+
     // Toggles
-    var reprojection = true             // gyro "timewarp" of the passthrough to display time
+    var reprojection = true            // gyro "timewarp" of the passthrough to display time
     var showGrid = false                // world-locked 15° grid + horizon (debug)
-    var showCube = true                 // world-locked wireframe cube 1 m ahead
+
+    // Game
+    var scene = GameScene.pingPong      // what is placed ahead on a tap
+    var tableDropM: Float = 0.80        // table surface below the eyes (standing ~0.8, seated ~0.45)
+    var opponentLevel: Float = 0.5      // 0 gentle ... 1 fast
+    var assist: Float = 0.5             // 0 realistic ... 1: forgiving paddle, steered shots, slower ball
+    var floatingServe = true            // a new ball hovers at serve height, ready to hit
+    var gripAngleDeg: Float = 40        // paddle blade from the knuckle direction toward the thumb
+    var gripOffsetMM: Float = -12       // blade plane along the palm normal (- = into the fist)
+    var paddlePrediction: Float = 0.08  // s the hands are predicted ahead (toward display time)
+    var gameVolume: Float = 0.8
+    var shortExposure = false           // camera exposure capped (sharper hands in fast swings, noisier)
 
     private static let storageKey = "viewerProfile.v2"
 
@@ -113,6 +132,20 @@ struct ViewerProfile: Codable, Equatable {
         let halfSeparation = interLensMM / 1000 / 2 * pixelsPerMeter
         let y = h - (trayToLensMM - bottomBezelMM) / 1000 * pixelsPerMeter
         return (SIMD2(w / 2 - halfSeparation, y), SIMD2(w / 2 + halfSeparation, y))
+    }
+}
+
+enum GameScene: String, Codable, CaseIterable {
+    case pingPong
+    case cube           // the tracking test cube
+    case none
+
+    var label: String {
+        switch self {
+        case .pingPong: "Ping pong"
+        case .cube: "Test cube"
+        case .none: "Nothing"
+        }
     }
 }
 

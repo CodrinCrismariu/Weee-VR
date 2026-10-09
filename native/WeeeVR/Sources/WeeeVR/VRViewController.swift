@@ -46,6 +46,10 @@ final class VRViewController: UIViewController {
         let longPress = UILongPressGestureRecognizer(target: self, action: #selector(onLongPress))
         longPress.minimumPressDuration = 0.8
         view.addGestureRecognizer(longPress)
+
+        let center = NotificationCenter.default
+        center.addObserver(self, selector: #selector(onActive), name: UIApplication.didBecomeActiveNotification, object: nil)
+        center.addObserver(self, selector: #selector(onInactive), name: UIApplication.willResignActiveNotification, object: nil)
     }
 
     override func viewDidAppear(_ animated: Bool) {
@@ -53,7 +57,19 @@ final class VRViewController: UIViewController {
         view.setNeedsLayout()
         view.layoutIfNeeded()
         if let view = view as? MetalView { model.engine?.attach(to: view.metalLayer) }
+        model.setVRScreen(view.window?.windowScene?.screen)
     }
+
+    override func viewWillDisappear(_ animated: Bool) {
+        super.viewWillDisappear(animated)
+        model.setVRScreen(nil)
+    }
+
+    @objc private func onActive() {
+        if view.window != nil { model.setVRScreen(view.window?.windowScene?.screen) }
+    }
+
+    @objc private func onInactive() { model.setVRScreen(nil) }
 
     override var prefersHomeIndicatorAutoHidden: Bool { true }
     override var prefersStatusBarHidden: Bool { true }

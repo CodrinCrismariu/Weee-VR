@@ -4,7 +4,8 @@
 /// One full-screen triangle; the fragment shader does everything per pixel:
 ///   screen pixel -> lens tan-angle -> Cardboard pincushion (k1, k2) -> world ray from this eye's real
 ///   position at display time -> hit the depth-proxy sphere (radius D around the eyes) -> project that
-///   point into the camera at its capture pose -> YCbCr sample.
+///   point into the camera at its capture pose -> YCbCr sample (sharpened, per colour channel against
+///   the lens's chromatic aberration, converted for the P3 screen).
 /// Viewing the camera image from each eye's own position corrects the camera/eye offset, gives the
 /// passthrough stereo disparity, and reprojects head rotation *and* translation, all exact at depth D.
 /// A world-locked grid, a stereo wireframe cube, tracked 3D hands and the HUD are drawn in the same pass.
@@ -26,6 +27,8 @@ enum ShaderSource {
         float4 head;        // eye midpoint in world at display time; w = depth-proxy distance D (m)
         float4 cube;        // world centre xyz, half size
         float4 hud;         // HUD top-left offset from each lens centre (px), HUD width, height (px)
+        float4 image;       // YCbCr matrix (0 BT.601, 1 BT.709), sharpening, black lift, lens-edge softness
+        float4 chroma;      // red, blue tan-angle scale - 1 (lens chromatic aberration), sRGB -> P3 (0/1), 0
     };
 
     struct VOut { float4 position [[position]]; };
@@ -70,15 +73,373 @@ enum ShaderSource {
         return -1.0;
     }
 
-    constant float4x4 kYCbCrToRGB = float4x4(
-        float4(+1.0000f, +1.0000f, +1.0000f, +0.0000f),
-        float4(+0.0000f, -0.3441f, +1.7720f, +0.0000f),
-        float4(+1.4020f, -0.7141f, +0.0000f, +0.0000f),
-        float4(-0.7010f, +0.5291f, -0.8860f, +1.0000f));
+    // Camera texture coordinate of what the eye at `eye` sees in eye-space direction `tanEye`: the ray
+    // hits the depth-proxy sphere around the eyes, and that point is projected into the camera at its
+    // capture pose. False when it falls outside the camera image.
+    static bool cameraUV(float2 tanEye, float3 eye, constant Uniforms& u, float3x3 worldFromView,
+                         float3x3 camFromWorld, thread float2& uv) {
+        float3 ray = normalize(worldFromView * normalize(float3(tanEye * u.optics.z, -1.0)));
+        float3 rel = eye - u.head.xyz;
+        float b = dot(ray, rel);
+        float c = dot(rel, rel) - u.head.w * u.head.w;
+        float t = -b + sqrt(max(b * b - c, 0.0));
+        float3 camRay = camFromWorld * (eye + ray * t - u.camPos.xyz);
+        if (camRay.z >= -1e-3) return false;
+        float2 tanCam = camRay.xy / -camRay.z;
+        uv = float2(u.camK.x * tanCam.x + u.camK.z, u.camK.w - u.camK.y * tanCam.y) / u.cam.xy;
+        if (u.cam.w > 0.5) { uv = 1.0 - uv; }
+        return all(uv >= 0.0) && all(uv <= 1.0);
+    }
+
+    // Camera luma at `uv`. With `amount` > 0: Catmull-Rom bicubic (5 bilinear taps, corners dropped)
+    // plus an unsharp step against a 3x3 tent blur (4 diagonal bilinear taps), limited to the local
+    // range so edges get no halos. Undoes some of the blur of resampling the image twice (the ISP's
+    // lens correction, then this warp).
+    static float lumaAt(texture2d<float> tex, sampler s, float2 uv, float2 size, float amount) {
+        if (amount <= 0.0) return tex.sample(s, uv).r;
+        float2 pos = uv * size;
+        float2 centre = floor(pos - 0.5) + 0.5;
+        float2 f = pos - centre;
+        float2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+        float2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+        float2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+        float2 w3 = f * f * (-0.5 + 0.5 * f);
+        float2 w12 = w1 + w2;
+        float2 t0 = (centre - 1.0) / size, t3 = (centre + 2.0) / size, t12 = (centre + w2 / w12) / size;
+        float top = w12.x * w0.y, left = w0.x * w12.y, mid = w12.x * w12.y, right = w3.x * w12.y, bottom = w12.x * w3.y;
+        float cubic = (tex.sample(s, float2(t12.x, t0.y)).r * top + tex.sample(s, float2(t0.x, t12.y)).r * left
+                       + tex.sample(s, t12).r * mid + tex.sample(s, float2(t3.x, t12.y)).r * right
+                       + tex.sample(s, float2(t12.x, t3.y)).r * bottom) / (top + left + mid + right + bottom);
+
+        float2 d = 0.5 / size;
+        float a = tex.sample(s, uv + float2(-d.x, -d.y)).r, b = tex.sample(s, uv + float2(d.x, -d.y)).r;
+        float c = tex.sample(s, uv + float2(-d.x, d.y)).r, e = tex.sample(s, uv + float2(d.x, d.y)).r;
+        float blur = (a + b + c + e) * 0.25;
+        float lo = min(min(min(a, b), min(c, e)), cubic), hi = max(max(max(a, b), max(c, e)), cubic);
+        return clamp(cubic + amount * (cubic - blur), lo, hi);
+    }
+
+    // Full-range YCbCr -> RGB with the buffer's matrix, then (optionally) sRGB/BT.709 primaries ->
+    // Display P3: the layer is not colour managed, so its values go to the P3 panel as they are, and
+    // unconverted video looks oversaturated there.
+    static float3 cameraRGB(texture2d<float> lumaTex, texture2d<float> chromaTex, sampler s, float2 uv,
+                            constant Uniforms& u) {
+        float y = lumaAt(lumaTex, s, uv, u.cam.xy, u.image.y);
+        float2 cbcr = chromaTex.sample(s, uv).rg - 128.0 / 255.0;
+        float3 rgb = u.image.x > 0.5
+            ? float3(y + 1.5748 * cbcr.y, y - 0.187324 * cbcr.x - 0.468124 * cbcr.y, y + 1.8556 * cbcr.x)
+            : float3(y + 1.402 * cbcr.y, y - 0.344136 * cbcr.x - 0.714136 * cbcr.y, y + 1.772 * cbcr.x);
+        rgb = saturate(rgb);
+        if (u.chroma.z > 0.5) {
+            float3 lin = select(pow((rgb + 0.055) / 1.055, 2.4), rgb / 12.92, rgb <= 0.04045);
+            lin = float3x3(float3(0.8225, 0.0332, 0.0171), float3(0.1774, 0.9669, 0.0724),
+                           float3(0.0, 0.0, 0.9108)) * lin;
+            rgb = select(1.055 * pow(lin, 1.0 / 2.4) - 0.055, lin * 12.92, lin <= 0.0031308);
+        }
+        return rgb;
+    }
+
+    // ---- Ping pong (Game/PingPong.sceneData), all in the table frame (Game/Table.swift): origin at
+    // the centre of the playing surface, y up, +z toward the player.
+    // scene[0] origin xyz, yaw | [1] cos yaw, sin yaw, floor y, flags (1 ball, 2 player paddle,
+    // 4 opponent paddle) | [2] ball xyz, radius | [3] light direction | [4..7], [8..11] paddles:
+    // blade centre + visible, x, y (toward the tip), z (forehand face) axes.
+    constant float kTableHalfLength = 1.37;
+    constant float kTableHalfWidth = 0.7625;
+    constant float kTableThickness = 0.025;
+    constant float kNetHeight = 0.1525;
+    constant float kNetHalfSpan = 0.915;
+    constant float kPaddleA = 0.075;            // blade semi-axes and half thickness
+    constant float kPaddleB = 0.079;
+    constant float kPaddleH = 0.006;
+    constant float kHandleLength = 0.10;
+    constant float kHandleHalfWidth = 0.0125;
+    constant float kHandleHalfThickness = 0.011;
+
+    constant int kTableTop = 0;
+    constant int kTableFrame = 1;
+    constant int kPost = 2;
+    constant int kBall = 3;
+    constant int kBlade = 4;
+    constant int kHandle = 5;
+
+    struct SceneHit {
+        float t;
+        float3 n;               // table frame
+        int object;
+        int which;              // paddle: 0 player, 1 opponent
+        float3 local;           // hit point in the object's frame (paddle parts: paddle frame)
+        float coverage;         // edge anti-aliasing: covered fraction of the pixel
+    };
+
+    // Ray / box: entry distance (> 0, -1 if missed or inside) and the entry face's normal.
+    static float boxHit(float3 ro, float3 rd, float3 lo, float3 hi, thread float3& n) {
+        float3 inv = 1.0 / rd;
+        float3 t0 = (lo - ro) * inv;
+        float3 t1 = (hi - ro) * inv;
+        float3 tmin = min(t0, t1);
+        float3 tmax = max(t0, t1);
+        float tn = max(max(tmin.x, tmin.y), tmin.z);
+        float tf = min(min(tmax.x, tmax.y), tmax.z);
+        if (tn > tf || tn <= 0.0) return -1.0;
+        if (tn == tmin.x) {
+            n = float3(-sign(rd.x), 0.0, 0.0);
+        } else if (tn == tmin.y) {
+            n = float3(0.0, -sign(rd.y), 0.0);
+        } else {
+            n = float3(0.0, 0.0, -sign(rd.z));
+        }
+        return tn;
+    }
+
+    static bool boxAny(float3 ro, float3 rd, float3 lo, float3 hi) {
+        float3 inv = 1.0 / rd;
+        float3 t0 = (lo - ro) * inv;
+        float3 t1 = (hi - ro) * inv;
+        float3 tmin = min(t0, t1);
+        float3 tmax = max(t0, t1);
+        float tn = max(max(tmin.x, tmin.y), tmin.z);
+        float tf = min(min(tmax.x, tmax.y), tmax.z);
+        return tf >= max(tn, 0.0);
+    }
+
+    static void keepBox(float3 ro, float3 rd, float3 lo, float3 hi, int object, thread SceneHit& best) {
+        float3 n;
+        float t = boxHit(ro, rd, lo, hi, n);
+        if (t > 0.0 && t < best.t) {
+            best.t = t;
+            best.n = n;
+            best.object = object;
+            best.which = -1;
+            best.local = ro + rd * t;
+            best.coverage = 1.0;
+        }
+    }
+
+    // Table: playing surface, under-frame, legs, cross bars, net posts. `rd` with no zero components.
+    static void tableHit(float3 ro, float3 rd, float floorY, thread SceneHit& best) {
+        if (!boxAny(ro, rd, float3(-0.95, floorY, -1.45), float3(0.95, 0.2, 1.45))) return;
+        keepBox(ro, rd, float3(-kTableHalfWidth, -kTableThickness, -kTableHalfLength),
+                float3(kTableHalfWidth, 0.0, kTableHalfLength), kTableTop, best);
+        keepBox(ro, rd, float3(-kTableHalfWidth + 0.06, -0.10, -kTableHalfLength + 0.06),
+                float3(kTableHalfWidth - 0.06, -kTableThickness, kTableHalfLength - 0.06), kTableFrame, best);
+        for (int i = 0; i < 4; i++) {
+            float x = (i & 1) ? kTableHalfWidth - 0.12 : -(kTableHalfWidth - 0.12);
+            float z = (i & 2) ? kTableHalfLength - 0.30 : -(kTableHalfLength - 0.30);
+            keepBox(ro, rd, float3(x - 0.02, floorY, z - 0.02), float3(x + 0.02, -0.10, z + 0.02), kTableFrame, best);
+        }
+        for (int i = 0; i < 2; i++) {
+            float z = i == 0 ? kTableHalfLength - 0.30 : -(kTableHalfLength - 0.30);
+            keepBox(ro, rd, float3(-kTableHalfWidth + 0.12, -0.62, z - 0.012),
+                    float3(kTableHalfWidth - 0.12, -0.58, z + 0.012), kTableFrame, best);
+        }
+        for (int i = 0; i < 2; i++) {
+            float x = i == 0 ? kNetHalfSpan : -kNetHalfSpan;
+            keepBox(ro, rd, float3(x - 0.012, -0.03, -0.012), float3(x + 0.012, kNetHeight + 0.012, 0.012), kPost, best);
+        }
+    }
+
+    // Ball, with an anti-aliased silhouette: rays passing within half a pixel of it count partly.
+    static void ballHit(float3 ro, float3 rd, float4 ball, float pixel, thread SceneHit& best) {
+        float3 oc = ro - ball.xyz;
+        float tca = -dot(oc, rd);
+        if (tca <= 0.0) return;
+        float m2 = max(dot(oc, oc) - tca * tca, 0.0);
+        float cover = saturate((ball.w - sqrt(m2)) / (pixel * tca) + 0.5);
+        if (cover <= 0.0) return;
+        float t = tca - sqrt(max(ball.w * ball.w - m2, 0.0));
+        if (t >= best.t) return;
+        float3 q = ro + rd * t;
+        best.t = t;
+        best.n = normalize(q - ball.xyz);
+        best.object = kBall;
+        best.which = -1;
+        best.local = q - ball.xyz;
+        best.coverage = cover;
+    }
+
+    // Paddle at scene[base]: oval blade (an elliptic cylinder, anti-aliased rim) and handle box.
+    static void paddleHit(float3 ro, float3 rd, constant float4* scene, int base, int which, float pixel,
+                          thread SceneHit& best) {
+        float4 c = scene[base];
+        if (c.w < 0.5) return;
+        float3 X = scene[base + 1].xyz, Y = scene[base + 2].xyz, Z = scene[base + 3].xyz;
+        float3 bc = ro - (c.xyz - Y * 0.06);
+        float bb = dot(rd, bc), cc = dot(bc, bc) - 0.21 * 0.21;
+        if (bb * bb - cc < 0.0 || (bb > 0.0 && cc > 0.0)) return;   // misses its bounding sphere
+        float3 o = ro - c.xyz;
+        float3 lo = float3(dot(o, X), dot(o, Y), dot(o, Z));
+        float3 ld = float3(dot(rd, X), dot(rd, Y), dot(rd, Z));
+        float2 axes = float2(kPaddleA, kPaddleB);
+        // Faces.
+        if (abs(ld.z) > 1e-6) {
+            for (int side = 0; side < 2; side++) {
+                float zc = side == 0 ? kPaddleH : -kPaddleH;
+                float t = (zc - lo.z) / ld.z;
+                if (t <= 0.0 || t >= best.t) continue;
+                float2 q = lo.xy + ld.xy * t;
+                float e = length(q / axes);
+                float cover = saturate((1.0 - e) * kPaddleA / (pixel * t) + 0.5);
+                if (cover <= 0.0) continue;
+                best.t = t;
+                best.n = side == 0 ? Z : -Z;
+                best.object = kBlade;
+                best.which = which;
+                best.local = float3(q, zc);
+                best.coverage = cover;
+            }
+        }
+        // Rim.
+        float2 ia = 1.0 / (axes * axes);
+        float A = dot(ld.xy * ld.xy, ia);
+        float B = 2.0 * dot(lo.xy * ld.xy, ia);
+        float C = dot(lo.xy * lo.xy, ia) - 1.0;
+        float D = B * B - 4.0 * A * C;
+        if (A > 1e-8 && D >= 0.0) {
+            float t = (-B - sqrt(D)) / (2.0 * A);
+            float3 q = lo + ld * t;
+            if (t > 0.0 && t < best.t && abs(q.z) <= kPaddleH) {
+                float2 nl = normalize(q.xy * ia);
+                best.t = t;
+                best.n = X * nl.x + Y * nl.y;
+                best.object = kBlade;
+                best.which = which;
+                best.local = q;
+                best.coverage = 1.0;
+            }
+        }
+        // Handle.
+        float3 lr = select(ld, float3(1e-6), abs(ld) < 1e-6);
+        float3 hn;
+        float th = boxHit(lo, lr, float3(-kHandleHalfWidth, -kPaddleB - kHandleLength, -kHandleHalfThickness),
+                          float3(kHandleHalfWidth, -kPaddleB + 0.01, kHandleHalfThickness), hn);
+        if (th > 0.0 && th < best.t) {
+            best.t = th;
+            best.n = X * hn.x + Y * hn.y + Z * hn.z;
+            best.object = kHandle;
+            best.which = which;
+            best.local = lo + ld * th;
+            best.coverage = 1.0;
+        }
+    }
+
+    // Nearest opaque scene hit; `skipWhich`/`skipBall` leave out the object a partly covered edge
+    // belongs to (to find what is behind it).
+    static SceneHit traceScene(float3 ro, float3 rd, constant float4* scene, float pixel, bool skipBall, int skipWhich) {
+        SceneHit best;
+        best.t = 1e9;
+        best.n = float3(0.0, 1.0, 0.0);
+        best.object = -1;
+        best.which = -1;
+        best.local = float3(0.0);
+        best.coverage = 1.0;
+        float3 rs = select(rd, float3(1e-6), abs(rd) < 1e-6);
+        tableHit(ro, rs, scene[1].z, best);
+        int flags = int(scene[1].w);
+        if ((flags & 1) && !skipBall) ballHit(ro, rd, scene[2], pixel, best);
+        if ((flags & 2) && skipWhich != 0) paddleHit(ro, rd, scene, 4, 0, pixel, best);
+        if ((flags & 4) && skipWhich != 1) paddleHit(ro, rd, scene, 8, 1, pixel, best);
+        return best;
+    }
+
+    // Materials and light: one soft key light from above plus a sky/floor ambient; soft shadows of the
+    // ball and paddles and the ball's contact darkening on the playing surface.
+    static float3 shadeScene(SceneHit h, float3 ro, float3 rd, constant float4* scene, float pixel) {
+        float3 L = scene[3].xyz;
+        float3 n = h.n;
+        float3 q = ro + rd * h.t;
+        float3 albedo = float3(0.5);
+        float spec = 0.05, shininess = 24.0;
+        if (h.object == kTableTop) {
+            if (n.y > 0.5) {
+                float fp = pixel * h.t;
+                float edge = min(kTableHalfWidth - abs(q.x), kTableHalfLength - abs(q.z));
+                float line = 1.0 - smoothstep(0.02 - fp, 0.02 + fp, edge);
+                line = max(line, 1.0 - smoothstep(0.0015 - fp, 0.0015 + fp, abs(q.x)));
+                albedo = mix(float3(0.06, 0.20, 0.42), float3(0.92), line);
+                spec = 0.06;
+                shininess = 40.0;
+            } else {
+                albedo = float3(0.05, 0.15, 0.32);
+            }
+        } else if (h.object == kTableFrame) {
+            albedo = float3(0.10, 0.10, 0.11);
+            spec = 0.15;
+            shininess = 30.0;
+        } else if (h.object == kPost) {
+            albedo = float3(0.08);
+            spec = 0.2;
+        } else if (h.object == kBall) {
+            albedo = float3(0.95, 0.94, 0.90);
+            spec = 0.35;
+            shininess = 50.0;
+        } else if (h.object == kBlade) {
+            if (h.local.z > kPaddleH * 0.99) {
+                albedo = float3(0.78, 0.08, 0.07);              // forehand rubber
+            } else if (h.local.z < -kPaddleH * 0.99) {
+                albedo = float3(0.05, 0.05, 0.055);             // backhand rubber
+            } else {
+                albedo = float3(0.80, 0.62, 0.40);              // wood edge
+            }
+            spec = 0.12;
+            shininess = 20.0;
+        } else {
+            albedo = float3(0.72, 0.54, 0.34);                  // handle
+            spec = 0.1;
+        }
+
+        float shadow = 1.0, ao = 1.0;
+        if (h.object == kTableTop && n.y > 0.5) {
+            float4 ball = scene[2];
+            if (int(scene[1].w) & 1) {
+                float height = max(ball.y, 0.0);
+                float2 centre = ball.xz - L.xz * (ball.y / L.y);
+                float d = length(q.xz - centre);
+                shadow *= 1.0 - 0.6 * (1.0 - smoothstep(ball.w * 0.5, ball.w * (1.5 + 2.0 * height) + 0.003, d))
+                    / (1.0 + 6.0 * height);
+                float3 toBall = ball.xyz - q;
+                float d2 = max(dot(toBall, toBall), 1e-6);
+                ao *= 1.0 - 0.5 * saturate(ball.w * ball.w / d2) * saturate(toBall.y * rsqrt(d2));
+            }
+            for (int i = 0; i < 2; i++) {
+                float4 c = scene[4 + 4 * i];
+                if (c.w < 0.5 || c.y < 0.0) continue;
+                float2 centre = c.xz - L.xz * (c.y / L.y);
+                float d = length(q.xz - centre);
+                shadow *= 1.0 - 0.35 * (1.0 - smoothstep(0.04, 0.10 + 0.25 * c.y, d)) / (1.0 + 3.0 * c.y);
+            }
+        }
+        float3 ambient = mix(float3(0.32, 0.30, 0.28), float3(0.58, 0.60, 0.64), 0.5 + 0.5 * n.y);
+        float diffuse = max(dot(n, L), 0.0) * shadow;
+        float specular = pow(max(dot(n, normalize(L - rd)), 0.0), shininess) * spec * shadow;
+        return albedo * (ambient * ao + 0.75 * diffuse) + specular;
+    }
+
+    // A soft shadow of the table on the (estimated) floor, darkening the passthrough under it.
+    static float floorShadow(float3 ro, float3 rd, float floorY) {
+        if (rd.y > -1e-4) return 1.0;
+        float t = (floorY - ro.y) / rd.y;
+        if (t <= 0.0) return 1.0;
+        float2 q = abs((ro + rd * t).xz);
+        float d = max(q.x - kTableHalfWidth, q.y - kTableHalfLength);
+        return 1.0 - 0.28 * (1.0 - smoothstep(-0.25, 0.30, d));
+    }
+
+    // The net: distance along the ray (-1: missed) and the hit's (x, height).
+    static float netHit(float3 ro, float3 rd, thread float2& q) {
+        if (abs(rd.z) < 1e-6) return -1.0;
+        float t = -ro.z / rd.z;
+        if (t <= 0.0) return -1.0;
+        float3 p = ro + rd * t;
+        if (abs(p.x) > kNetHalfSpan || p.y < 0.0 || p.y > kNetHeight) return -1.0;
+        q = p.xy;
+        return t;
+    }
 
     fragment half4 vrFragment(VOut in [[stage_in]],
                               constant Uniforms& u [[buffer(0)]],
                               constant float4* hands [[buffer(1)]],
+                              constant float4* scene [[buffer(2)]],
                               texture2d<float> lumaTex [[texture(0)]],
                               texture2d<float> chromaTex [[texture(1)]],
                               texture2d<float> hudTex [[texture(2)]]) {
@@ -100,33 +461,39 @@ enum ShaderSource {
         float3 worldRay = normalize(worldFromView * viewRay);
         float3 eye = u.head.xyz + worldFromView * float3((rightEye ? 0.5 : -0.5) * u.cam.z, 0.0, 0.0);
 
-        // Grid derivatives are taken before any divergent return.
-        float az = atan2(worldRay.x, -worldRay.z);
-        float el = asin(clamp(worldRay.y, -1.0, 1.0));
-        float2 g = float2(az, el) * (12.0 / M_PI_F);   // 15 degree cells
-        float2 fw = max(fwidth(g), float2(1e-4));
-        fw.x = min(fw.x, 0.5);                          // atan2 seam behind the viewer
+        int flags = int(u.optics.w);
 
-        if (length(tanEye) > u.lens.w) {
+        // Grid derivatives are taken before any divergent return (a branch on the uniform flags is
+        // not divergent), and only when the grid is shown.
+        float2 g = float2(0.0), fw = float2(1.0);
+        if (flags & 1) {
+            float az = atan2(worldRay.x, -worldRay.z);
+            float el = asin(clamp(worldRay.y, -1.0, 1.0));
+            g = float2(az, el) * (12.0 / M_PI_F);       // 15 degree cells
+            fw = max(fwidth(g), float2(1e-4));
+            fw.x = min(fw.x, 0.5);                      // atan2 seam behind the viewer
+        }
+
+        float radius = length(tanEye);
+        if (radius > u.lens.w) {
             return half4(0.0, 0.0, 0.0, 1.0);
         }
 
-        // Passthrough: hit the depth-proxy sphere around the eyes, then look that point up in the camera.
+        // Passthrough. The lens bends red, green and blue slightly differently (chromatic aberration),
+        // so with a correction set each channel is looked up along its own direction; the overlays
+        // below use the green one.
         float3 col = float3(0.05);
-        float3 rel = eye - u.head.xyz;
-        float b = dot(worldRay, rel);
-        float c = dot(rel, rel) - u.head.w * u.head.w;
-        float t = -b + sqrt(max(b * b - c, 0.0));
-        float3 camRay = camFromWorld * (eye + worldRay * t - u.camPos.xyz);
-        int flags = int(u.optics.w);
-
-        if (camRay.z < -1e-3) {
-            float2 tanCam = camRay.xy / -camRay.z;
-            float2 uv = float2(u.camK.x * tanCam.x + u.camK.z, u.camK.w - u.camK.y * tanCam.y) / u.cam.xy;
-            if (u.cam.w > 0.5) { uv = 1.0 - uv; }
-            if (all(uv >= 0.0) && all(uv <= 1.0)) {
-                float4 ycc = float4(lumaTex.sample(s, uv).r, chromaTex.sample(s, uv).rg, 1.0);
-                col = (kYCbCrToRGB * ycc).rgb;
+        float2 uv;
+        bool green = cameraUV(tanEye, eye, u, worldFromView, camFromWorld, uv);
+        if (all(u.chroma.xy == 0.0)) {
+            if (green) { col = cameraRGB(lumaTex, chromaTex, s, uv, u); }
+        } else {
+            if (green) { col.g = cameraRGB(lumaTex, chromaTex, s, uv, u).g; }
+            if (cameraUV(tanEye * (1.0 + u.chroma.x), eye, u, worldFromView, camFromWorld, uv)) {
+                col.r = cameraRGB(lumaTex, chromaTex, s, uv, u).r;
+            }
+            if (cameraUV(tanEye * (1.0 + u.chroma.y), eye, u, worldFromView, camFromWorld, uv)) {
+                col.b = cameraRGB(lumaTex, chromaTex, s, uv, u).b;
             }
         }
 
@@ -159,6 +526,37 @@ enum ShaderSource {
             }
         }
 
+        // Ping pong: the scene in the table frame. Edges of the ball and blades are anti-aliased by
+        // blending with whatever is behind them.
+        float sceneT = 1e9;
+        float netT = -1.0;
+        float2 netQ = float2(0.0);
+        if (flags & 16) {
+            float pixel = u.optics.z / (u.screen.z * u.screen.w) * (1.0 + 3.0 * u.optics.x * r2 + 5.0 * u.optics.y * r2 * r2);
+            float cy = scene[1].x, sy = scene[1].y;
+            float3 dw = eye - scene[0].xyz;
+            float3 tro = float3(cy * dw.x - sy * dw.z, dw.y, sy * dw.x + cy * dw.z);
+            float3 trd = float3(cy * worldRay.x - sy * worldRay.z, worldRay.y, sy * worldRay.x + cy * worldRay.z);
+            float3 passthrough = col * floorShadow(tro, trd, scene[1].z);
+            SceneHit hit = traceScene(tro, trd, scene, pixel, false, -1);
+            if (hit.t < 1e8) {
+                float3 front = shadeScene(hit, tro, trd, scene, pixel);
+                if (hit.coverage < 0.999) {
+                    SceneHit back = traceScene(tro, trd, scene, pixel, hit.object == kBall,
+                                               hit.object == kBlade ? hit.which : -1);
+                    float3 behind = back.t < 1e8 ? shadeScene(back, tro, trd, scene, pixel) : passthrough;
+                    front = mix(behind, front, hit.coverage);
+                }
+                col = front;
+                sceneT = hit.t;
+            } else {
+                col = passthrough;
+            }
+            netT = netHit(tro, trd, netQ);
+        }
+
+        float handT = 1e9;
+        float3 handCol = float3(0.0);
         if (flags & 8) {
             // Tracked hands: capsules along the bones, raytraced from this eye (true stereo).
             for (int h = 0; h < 2; h++) {
@@ -168,8 +566,8 @@ enum ShaderSource {
                 float3 oc = eye - bound.xyz;
                 float bb = dot(worldRay, oc);
                 if (bb * bb - (dot(oc, oc) - bound.w * bound.w) < 0.0) continue;   // misses the hand
-                float best = 1e9;
                 int hit = -1;
+                float best = handT;
                 for (int i = 0; i < 23; i++) {
                     float4 a = hand[2 + kBones[i].x], b = hand[2 + kBones[i].y];
                     if (a.w < 0.5 || b.w < 0.5) continue;
@@ -179,15 +577,26 @@ enum ShaderSource {
                 }
                 if (hit >= 0) {
                     float3 a = hand[2 + kBones[hit].x].xyz, b = hand[2 + kBones[hit].y].xyz;
-                    float3 p = eye + worldRay * best;
+                    float3 hp = eye + worldRay * best;
                     float3 ab = b - a;
-                    float3 n = normalize(p - (a + ab * saturate(dot(p - a, ab) / max(dot(ab, ab), 1e-8))));
+                    float3 n = normalize(hp - (a + ab * saturate(dot(hp - a, ab) / max(dot(ab, ab), 1e-8))));
                     float3 base = hand[0].w > 0.5 ? float3(0.35, 1.0, 0.6) : float3(0.3, 0.75, 1.0);
                     float lambert = 0.35 + 0.65 * saturate(dot(n, -worldRay));
                     float rim = pow(1.0 - saturate(dot(n, -worldRay)), 3.0);
-                    col = mix(col, base * lambert + rim * 0.5, 0.85);
+                    handT = best;
+                    handCol = base * lambert + rim * 0.5;
                 }
             }
+            // In front of the scene only: a hand behind the paddle or the table is hidden by it.
+            if (handT < sceneT) { col = mix(col, handCol, (flags & 16) ? 0.95 : 0.85); }
+        }
+
+        if (netT > 0.0 && netT < min(sceneT, handT)) {
+            // The net: a translucent dark mesh with a white top band and a cord at the bottom.
+            bool band = netQ.y > kNetHeight - 0.015;
+            bool cord = netQ.y < 0.005;
+            float3 netCol = band ? float3(0.93) : float3(0.03, 0.04, 0.05);
+            col = mix(col, netCol, band || cord ? 1.0 : 0.55);
         }
 
         if (flags & 4) {
@@ -199,7 +608,11 @@ enum ShaderSource {
             }
         }
 
-        return half4(half3(saturate(col)), 1.0h);
+        // OLED: lifting black slightly keeps pixels from switching fully off, which smears dark areas
+        // when the head turns. Then a soft fade to true black over the outer part of each lens.
+        col = u.image.z + saturate(col) * (1.0 - u.image.z);
+        col *= 1.0 - smoothstep(u.lens.w * (1.0 - max(u.image.w, 1e-3)), u.lens.w, radius);
+        return half4(half3(col), half(1.0));
     }
     """
 }

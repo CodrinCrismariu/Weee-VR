@@ -19,13 +19,23 @@ import simd
 final class HandModel {
     static let stride = 23              // float4 per hand: info, bounding sphere, 21 joints
     static let empty = [SIMD4<Float>](repeating: .zero, count: 2 * stride)
-    static let maxPrediction = 0.06     // s
+    static let maxPrediction = 0.06     // s, passthrough overlay
     static let timeout = 0.2            // s without a detection hides the hand
+    /// s a hand the tracker lost stays (frozen) before it hides. The game holds it longer: a paddle
+    /// mustn't blink out during a blurred swing.
+    var lostHold = 0.12
+
+    /// Where joints are placed. Overlay: on the passthrough's depth sphere, covering the camera's hand
+    /// in both eyes. True depth: at the hand's real distance (from palm proportions), real size, for
+    /// interacting with virtual objects at their real distances (the game).
+    var trueDepth = false {
+        didSet { if trueDepth != oldValue { reset() } }
+    }
 
     /// Palm segments with typical adult lengths (m): wrist-index MCP, wrist-middle MCP, wrist-little
     /// MCP, index MCP-little MCP. Foreshortening only makes a segment look shorter (the hand look
     /// farther), so the nearest estimate wins.
-    private static let palmSegments: [(Int, Int, Float)] = [(0, 5, 0.080), (0, 9, 0.083), (0, 17, 0.070), (5, 17, 0.058)]
+    static let palmSegments: [(Int, Int, Float)] = [(0, 5, 0.080), (0, 9, 0.083), (0, 17, 0.070), (5, 17, 0.058)]
 
     private struct Slot {
         var id: Int
@@ -33,6 +43,8 @@ final class HandModel {
         var filters = [OneEuro3](repeating: OneEuro3(), count: HandTracker.jointCount)
         var valid = [Bool](repeating: false, count: HandTracker.jointCount)
         var time = 0.0
+        var lost = false                // a newer detection didn't have it: hold still, then hide
+        var lead: Float = 0             // prediction used while it was tracked
         var radiusScale: Float = 1
     }
 
@@ -74,15 +86,16 @@ final class HandModel {
                 if angle > 1e-4 { trueRange = min(trueRange, length * handScale / (2 * sin(angle / 2))) }
             }
             trueRange = trueRange.isFinite ? min(max(trueRange, 0.15), 1.2) : sphereRange
-            let radiusScale = sphereRange / trueRange
+            let radiusScale = trueDepth ? 1 : sphereRange / trueRange
 
-            // MediaPipe's relative depth (image pixels, wrist-relative) -> metres at the hand, scaled
-            // like the rest of the hand onto the sphere; along each joint's own camera ray, so the
-            // hand still covers the passthrough hand.
+            // MediaPipe's relative depth (image pixels, wrist-relative) -> metres at the hand. Overlay:
+            // scaled like the rest of the hand onto the sphere, along each joint's own camera ray, so
+            // the hand still covers the passthrough hand. True depth: from the hand's real distance.
             let metresPerPixel = trueRange / k.x * radiusScale
             var world = [SIMD3<Float>](repeating: .zero, count: HandTracker.jointCount)
             for i in 0..<HandTracker.jointCount where hand.valid[i] {
-                let t = sphereT[i] + (hand.depths[i] - hand.depths[0]) * metresPerPixel
+                let base = trueDepth ? trueRange : sphereT[i]
+                let t = base + (hand.depths[i] - hand.depths[0]) * metresPerPixel
                 world[i] = origin + directions[i] * t
             }
 
@@ -101,24 +114,30 @@ final class HandModel {
             slot.valid = hand.valid
             slot.time = detection.captureTime
             slot.chirality = hand.chirality
+            slot.lost = false
             slots[index] = slot
         }
+        // Not in this detection: lost. Extrapolating it would fling it off along its last velocity
+        // (straight ahead in a punch), so it is held where it was and hidden soon after.
+        for index in 0..<2 where !taken[index] { slots[index]?.lost = true }
     }
 
     func reset() { slots = [nil, nil] }
 
     var visibleCount: Int { slots.compactMap { $0 }.count }
 
-    /// Shader data for both hands, predicted to `time` (the passthrough frame's capture time).
-    func uniforms(time displayTime: Double) -> [SIMD4<Float>] {
+    /// Shader data for both hands, predicted to `time` (overlay: the passthrough frame's capture time;
+    /// game: the display time), at most `maxLead` past their detection.
+    func uniforms(time displayTime: Double, maxLead: Double = HandModel.maxPrediction) -> [SIMD4<Float>] {
         var out = Self.empty
         for h in 0..<2 {
-            guard let slot = slots[h], displayTime - slot.time < Self.timeout else {
+            guard let slot = slots[h], displayTime - slot.time < (slot.lost ? lostHold : Self.timeout) else {
                 slots[h] = nil
                 continue
             }
             let base = h * Self.stride
-            let lead = Float(min(max(displayTime - slot.time, 0), Self.maxPrediction))
+            let lead = slot.lost ? slot.lead : Float(min(max(displayTime - slot.time, 0), maxLead))
+            slots[h]?.lead = lead
             var joints = [SIMD3<Float>](repeating: .zero, count: HandTracker.jointCount)
             var centre = SIMD3<Float>.zero
             var count: Float = 0
@@ -138,6 +157,14 @@ final class HandModel {
             out[base] = SIMD4(1, slot.radiusScale, 0, Float(slot.chirality))
         }
         return out
+    }
+
+    /// Joints (world, MediaPipe order) of the shown hand with `chirality` (0 left, 1 right), as
+    /// `uniforms` last predicted them; nil when that hand isn't shown. Call after `uniforms`.
+    func joints(chirality: Int) -> [SIMD3<Float>]? {
+        guard let slot = slots.first(where: { $0?.chirality == chirality }) ?? nil,
+              slot.valid.allSatisfy({ $0 }) else { return nil }
+        return slot.filters.map { $0.predict(seconds: slot.lead) }
     }
 
     /// The tracker keeps each hand's id across frames: same id -> same slot (keeps its filter), else

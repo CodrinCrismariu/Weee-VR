@@ -48,6 +48,17 @@ typedef struct {
     int landmarks;                  // valid landmarks in the sliding window
     double depth_median;            // median camera depth of landmarks within ±20° of the axis, 0 if unknown
     uint64_t images;                // images pushed since create/reset
+
+    // Relocalization. Each tracking loss makes XRSLAM start a new map with its own world. While a
+    // map is `aligned`, the pose above is in the session world (the world of the session's first
+    // map); otherwise it is in the map's own world. A new map is aligned when the camera recognises
+    // the session's keyframes (`relocalizations` counts these), or after 20 s without that it starts
+    // a new session in its own world (`session_id` changes).
+    uint64_t map_id;                // changes with every new XRSLAM map
+    uint64_t session_id;            // changes on reset and when a map gives up relocalizing
+    int aligned;                    // 1: pose in the session world
+    int keyframes;                  // relocalization keyframes stored for the session
+    int relocalizations;            // maps aligned to the session by relocalization
 } WeeeSLAMState;
 
 typedef struct WeeeSLAM WeeeSLAM;
@@ -65,6 +76,11 @@ void weee_slam_push_image(WeeeSLAM *slam, double t, const uint8_t *gray, int wid
 
 void weee_slam_get_state(WeeeSLAM *slam, WeeeSLAMState *state);
 const char *weee_slam_version(void);
+
+/// Relocalization work (keyframe capture while aligned, matching while not): call a few times a
+/// second from a low-priority thread, never concurrently with destroy. It only briefly takes the
+/// locks shared with the other calls; descriptor extraction and matching run outside them.
+void weee_slam_reloc_step(WeeeSLAM *slam);
 
 /// Hand models: sample a `size` x `size` RGB crop (planar float, 0..1, R then G then B planes) from a
 /// bi-planar 4:2:0 full-range YCbCr image through the affine map from crop pixel (u, v) to image

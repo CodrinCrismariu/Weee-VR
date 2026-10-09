@@ -32,6 +32,7 @@ final class VREngine: NSObject, CAMetalDisplayLinkDelegate {
         var tracking: String?
         var slamInfo: String?
         var handsInfo: String?
+        var gameInfo: String?
         var position: SIMD3<Float>
         var depth: Float
         var attachedIntrinsics: Bool
@@ -43,6 +44,7 @@ final class VREngine: NSObject, CAMetalDisplayLinkDelegate {
     private static let cubeHalfSize: Float = 0.15
     private static let maxSpeed: Float = 2           // m/s cap for position extrapolation
     private static let maxExtrapolation = 0.1        // s
+    private static let sportsExposure = 0.005        // s: "short exposure" cap for sharp fast hands
 
     let stats = LatencyStats()
     let mailbox = FrameMailbox()
@@ -55,6 +57,8 @@ final class VREngine: NSObject, CAMetalDisplayLinkDelegate {
     private let recorder: CalibrationRecorder
     private let hands = HandTracker()
     private let handModel = HandModel()              // render thread only
+    private let game = PingPong()                    // render thread only
+    private let gameAudio = GameAudio()
 
     private let lock = NSLock()
     private var viewer: ViewerProfile
@@ -80,6 +84,7 @@ final class VREngine: NSObject, CAMetalDisplayLinkDelegate {
     private var lastIntrinsics = SIMD4<Float>(1, 1, 0, 0)
     private var lastFrameSize = SIMD2<Float>(0, 0)
     private var lastHandCount = 0
+    private var lastGameSummary: String?
     private var handResetPending = false
     private var workEstimate = 0.002                 // peak-decayed CPU + GPU seconds per frame
     private var missPenalty = 0.0
@@ -95,10 +100,17 @@ final class VREngine: NSObject, CAMetalDisplayLinkDelegate {
         self.viewer = viewer
         (mode, lens) = Self.source(for: viewer.passthrough)
         hands.enabled = viewer.handTracking
+        hands.flipped = viewer.flipCamera
         super.init()
         let onStatus: (String) -> Void = { [weak self] status in self?.setSourceStatus(status) }
         avSource.onStatus = onStatus
         arSource.onStatus = onStatus
+        game.onSound = { [gameAudio] kind, position, speed in gameAudio.play(kind, at: position, speed: speed) }
+        game.onEvent = { Log.info("game: \($0)") }
+        gameAudio.volume = viewer.gameVolume
+        DispatchQueue.global(qos: .utility).async {
+            for line in GameSelfTest.run() { Log.info("game self-test: \(line)") }
+        }
     }
 
     var device: MTLDevice { renderer.device }
@@ -158,6 +170,7 @@ final class VREngine: NSObject, CAMetalDisplayLinkDelegate {
             presetIndex = presets.indices.first { AVCameraSource.isAvailable(lens: lens, preset: presets[$0]) } ?? 0
         }
         let mode = self.mode, lens = self.lens, preset = presets[presetIndex], slamSettings = viewer.slamSettings
+        let exposure = viewer.shortExposure ? Self.sportsExposure : nil
         lensOffset = mode != .arkit ? AVCameraSource.offsetFromMain(lens: lens) : .zero
         resetPoseStateLocked()
         lock.unlock()
@@ -170,6 +183,7 @@ final class VREngine: NSObject, CAMetalDisplayLinkDelegate {
             xrSource.stop()
             avSource.frameHook = { [hands] frame in hands.submit(frame) }
             avSource.start(lens: lens, preset: preset)
+            avSource.capExposure(to: exposure)
         case .xrslam:
             arSource.stop()
             xrSource.start(settings: slamSettings)
@@ -178,6 +192,7 @@ final class VREngine: NSObject, CAMetalDisplayLinkDelegate {
                 hands.submit(frame)
             }
             avSource.start(lens: lens, preset: preset)
+            avSource.capExposure(to: exposure)
         case .arkit:
             avSource.stop()
             xrSource.stop()
@@ -192,16 +207,24 @@ final class VREngine: NSObject, CAMetalDisplayLinkDelegate {
     func update(viewer: ViewerProfile) {
         lock.lock()
         let oldSlamSettings = self.viewer.slamSettings
+        let oldShortExposure = self.viewer.shortExposure
+        let oldScene = self.viewer.scene, oldTableDrop = self.viewer.tableDropM
         self.viewer = viewer
         let (newMode, newLens) = Self.source(for: viewer.passthrough)
         let restart = (newMode != mode || newLens != lens) && started
         let retune = !restart && started && newMode == .xrslam && viewer.slamSettings != oldSlamSettings
+        let exposureChanged = viewer.shortExposure != oldShortExposure
+        let sceneChanged = viewer.scene != oldScene || viewer.tableDropM != oldTableDrop
+        if sceneChanged { recenterPending = true }
         if newLens != lens { presetIndex = 0 }
         hands.enabled = viewer.handTracking
+        hands.flipped = viewer.flipCamera
         mode = newMode
         lens = newLens
         lock.unlock()
+        gameAudio.volume = viewer.gameVolume
         if restart { startCurrentSource() }
+        if exposureChanged, !restart, newMode != .arkit { avSource.capExposure(to: viewer.shortExposure ? Self.sportsExposure : nil) }
         if retune {
             xrSource.configure(viewer.slamSettings)
             resetTracking()
@@ -227,8 +250,9 @@ final class VREngine: NSObject, CAMetalDisplayLinkDelegate {
         guard !recorder.isRecording else { return }
         avSource.frameHook = { [recorder] frame in recorder.add(frame) }
         avSource.limitExposure(to: 0.004)
-        recorder.start { [weak self] directory in
-            self?.avSource.frameHook = nil
+        recorder.start { [weak self, hands] directory in
+            // Back to the gyro mode's hook (the caller then restores its previous mode, if different).
+            self?.avSource.frameHook = { frame in hands.submit(frame) }
             self?.avSource.limitExposure(to: nil)
             onFinish(directory)
         }
@@ -237,24 +261,41 @@ final class VREngine: NSObject, CAMetalDisplayLinkDelegate {
     var isRecordingCalibration: Bool { recorder.isRecording }
     var calibrationStatus: String? { recorder.status }
 
+    /// HUD/log line: hands shown, tracker time and rate, lost hands regained / dropped since launch.
+    private func handsInfo(shown: Int) -> String {
+        let s = hands.stats
+        let ms = (s.ms * 10).rounded() / 10
+        let n = s.newHands
+        return "hands \(shown) · \(ms) ms @ \(Int(s.hz.rounded())) Hz · regained \(s.regained) dropped \(s.dropped)"
+            + " · new \(n.started)→\(n.confirmed) palm miss \(n.palmMisses)/\(n.palmRuns)"
+            + " rej p\(n.rejectPresence) r\(n.rejectReach) t\(n.rejectTilt)"
+    }
+
     func status() -> Status {
+        // Own state under `lock`; the sources' getters outside it, so a source holding its own lock
+        // can never make the render thread wait on `lock`.
         lock.lock()
-        defer { lock.unlock() }
-        return Status(
+        let mode = self.mode, handTracking = viewer.handTracking, handCount = lastHandCount
+        var status = Status(
             mode: mode,
             source: sourceStatus,
-            tracking: mode == .arkit ? arSource.trackingState : mode == .xrslam ? xrSource.trackingState : nil,
-            slamInfo: mode == .xrslam ? xrSource.info : nil,
-            handsInfo: viewer.handTracking
-                ? String(format: "hands %ld · vision %.1f ms @ %.0f Hz", lastHandCount, hands.stats.ms, hands.stats.hz)
-                : nil,
+            tracking: nil,
+            slamInfo: nil,
+            handsInfo: nil,
+            gameInfo: lastGameSummary,
             position: lastPosition,
             depth: lastDepth,
-            attachedIntrinsics: mode == .arkit || avSource.usingAttachedIntrinsics,
+            attachedIntrinsics: mode == .arkit,
             cameraFovDeg: SIMD2(2 * atan(lastFrameSize.x / 2 / lastIntrinsics.x),
                                 2 * atan(lastFrameSize.y / 2 / lastIntrinsics.y)) * 180 / .pi,
             renderBudgetMS: renderBudget * 1000
         )
+        lock.unlock()
+        status.tracking = mode == .arkit ? arSource.trackingState : mode == .xrslam ? xrSource.trackingState : nil
+        status.slamInfo = mode == .xrslam ? xrSource.info : nil
+        status.handsInfo = handTracking ? handsInfo(shown: handCount) : nil
+        status.attachedIntrinsics = status.attachedIntrinsics || avSource.usingAttachedIntrinsics
+        return status
     }
 
     private func setSourceStatus(_ status: String) {
@@ -297,12 +338,15 @@ final class VREngine: NSObject, CAMetalDisplayLinkDelegate {
         let size = SIMD2<Float>(Float(drawable.texture.width), Float(drawable.texture.height))
         let frame = mailbox.take()
         var handData = HandModel.empty
+        var sceneData = [SIMD4<Float>](repeating: .zero, count: PingPong.sceneCount)
         let uniforms = frame.map {
-            makeUniforms(frame: $0, displayTime: update.targetPresentationTimestamp, size: size, hands: &handData)
+            makeUniforms(frame: $0, displayTime: update.targetPresentationTimestamp, size: size, hands: &handData,
+                         scene: &sceneData)
         } ?? Uniforms()
 
         let captureTime = frame?.captureTime, arrivalTime = frame?.arrivalTime
-        renderer.draw(to: drawable, frame: frame, uniforms: uniforms, hands: handData, presented: { [stats] presentedTime in
+        renderer.draw(to: drawable, frame: frame, uniforms: uniforms, hands: handData, scene: sceneData,
+                      presented: { [stats] presentedTime in
             guard let captureTime, let arrivalTime else { return }
             stats.addPresent(captureTime: captureTime, arrivalTime: arrivalTime, presentedTime: presentedTime)
         }, completed: { [weak self] gpuSeconds in
@@ -318,7 +362,7 @@ final class VREngine: NSObject, CAMetalDisplayLinkDelegate {
     // MARK: Per-frame maths
 
     private func makeUniforms(frame: CameraFrame, displayTime: Double, size: SIMD2<Float>,
-                              hands handData: inout [SIMD4<Float>]) -> Uniforms {
+                              hands handData: inout [SIMD4<Float>], scene sceneData: inout [SIMD4<Float>]) -> Uniforms {
         lock.lock()
         let vp = viewer
         lock.unlock()
@@ -390,7 +434,9 @@ final class VREngine: NSObject, CAMetalDisplayLinkDelegate {
         let head = viewPosition + viewRotation * (vp.eyeOffset - lensOffset)
         let depth = vp.autoDepth ? (frame.proxyDepth ?? vp.fixedDepthM) : vp.fixedDepthM
 
-        // Recenter: place the cube 1 m ahead once there is a valid pose (ARKit: once tracking is normal).
+        // Recenter: place the cube 1 m ahead / the table in front once there is a valid pose (ARKit,
+        // XRSLAM: once tracking is normal).
+        let playing = vp.scene == .pingPong
         if recenterPending {
             if frame.pose == nil, qDisplay != nil {
                 let unrecentered = Frames.rotationY(yawOffset) * worldFromView
@@ -398,21 +444,27 @@ final class VREngine: NSObject, CAMetalDisplayLinkDelegate {
                 recenterPending = false
                 cubeCenter = head + SIMD3<Float>(Self.cubeOffset)
                 cubeVisible = true
+                if playing { game.place(head: head, yaw: 0) }      // heading recentered to 0 from now on
             } else if frame.pose != nil, frame.trackingNormal {
                 recenterPending = false
                 cubeCenter = head + SIMD3<Float>(Frames.rotationY(Frames.yaw(of: worldFromView)) * Self.cubeOffset)
                 cubeVisible = true
+                if playing { game.place(head: head, yaw: Frames.yaw(of: worldFromView)) }
             }
         }
-        let cube = cubeCenter, showCube = cubeVisible && vp.showCube
+        let cube = cubeCenter, showCube = cubeVisible && vp.scene == .cube
 
-        // Hands: place new detections in the world with the camera pose at their capture time, on the
-        // passthrough's depth sphere so they cover the passthrough hands, then predict to this
+        // Hands: place new detections in the world with the camera pose at their capture time. Overlay:
+        // on the passthrough's depth sphere so they cover the passthrough hands, predicted to this
         // passthrough frame's capture time so they move with the hands as the passthrough shows them.
+        // Game: at their true depth (they hold the paddle and pick up the ball), predicted toward the
+        // display time.
         if handResetPending {
             handResetPending = false
             handModel.reset()
         }
+        handModel.trueDepth = playing
+        handModel.lostHold = playing ? 0.3 : 0.12
         var handFlags: Float = 0
         if vp.handTracking {
             let detection = hands.latestDetection()
@@ -429,11 +481,32 @@ final class VREngine: NSObject, CAMetalDisplayLinkDelegate {
             let detectionHead = detectionPose.map { $0.1 + $0.0 * (vp.eyeOffset - lensOffset) } ?? head
             handModel.update(detection, pose: detectionPose, head: detectionHead, proxyDepth: depth,
                              flip: vp.flipCamera, handScale: vp.handScale)
-            handData = handModel.uniforms(time: frame.captureTime)
+            handData = playing
+                ? handModel.uniforms(time: displayTarget, maxLead: Double(vp.paddlePrediction))
+                : handModel.uniforms(time: frame.captureTime)
             lastHandCount = handModel.visibleCount
             if lastHandCount > 0, vp.handOverlay { handFlags = 8 }
         } else {
             lastHandCount = 0
+        }
+
+        // The game, stepped to the display time with the hands as drawn.
+        var sceneFlags: Float = 0
+        if playing, game.placed {
+            game.settings = GameSettings(tableDrop: Double(vp.tableDropM), opponentLevel: Double(vp.opponentLevel),
+                                         gripAngle: Double(vp.gripAngleDeg) * .pi / 180,
+                                         gripOffset: Double(vp.gripOffsetMM) / 1000,
+                                         assist: Double(vp.assist), floatingServe: vp.floatingServe)
+            game.update(time: displayTarget,
+                        right: vp.handTracking ? handModel.joints(chirality: 1) : nil,
+                        left: vp.handTracking ? handModel.joints(chirality: 0) : nil)
+            sceneData = game.sceneData()
+            sceneFlags = 16
+            gameAudio.setListener(position: head, forward: viewRotation * SIMD3<Float>(0, 0, -1),
+                                  up: viewRotation * SIMD3<Float>(0, 1, 0))
+            lastGameSummary = game.summary
+        } else {
+            lastGameSummary = nil
         }
         lastPosition = viewPosition
         lastDepth = depth
@@ -443,13 +516,16 @@ final class VREngine: NSObject, CAMetalDisplayLinkDelegate {
 
         let hud = renderer.hasHUD
         u.optics = SIMD4(vp.k1, vp.k2, vp.fovScale,
-                         (vp.showGrid ? 1 : 0) + (showCube ? 2 : 0) + (hud ? 4 : 0) + handFlags)
+                         (vp.showGrid ? 1 : 0) + (showCube ? 2 : 0) + (hud ? 4 : 0) + handFlags + sceneFlags)
         u.setCameraFromWorld(cameraRotation.transpose.float)
         u.camPos = SIMD4(cameraPosition, 0)
         u.setWorldFromView(viewRotation)
         u.head = SIMD4(head, depth)
         u.cube = SIMD4(cube, Self.cubeHalfSize)
         u.hud = SIMD4(-HUDRasterizer.size.x / 2, -HUDRasterizer.size.y - 120, HUDRasterizer.size.x, HUDRasterizer.size.y)
+        u.image = SIMD4(vp.accurateColor ? frame.ycbcrMatrix : 0, vp.sharpening, vp.blackLift, vp.edgeSoftness)
+        u.chroma = SIMD4(-vp.chromaticAberration, vp.chromaticAberration,
+                         vp.accurateColor && frame.needsP3Conversion ? 1 : 0, 0)
         return u
     }
 }

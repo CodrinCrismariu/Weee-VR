@@ -19,14 +19,19 @@ import simd
 /// so it is combined with where the wrist is in the image and which way the hand leans (a left hand's
 /// fingers point up-right, a right hand's up-left). Two tracked hands never share a side.
 ///
-/// False positives: a palm must score 0.75, a new hand 0.8 presence (0.6 to keep tracking), its palm
-/// must be big enough in the image to be within arm's reach (~0.9 m), and it must be seen in two
-/// consecutive frames before it is reported.
+/// Fast motion (punches): each crop is moved by the hand's image velocity and grown with the
+/// distance moved. A hand the landmark model loses (motion blur) coasts for 0.25 s: the palm detector
+/// runs at once, and a palm near where the hand was heading takes over its track (same id and side,
+/// no re-confirmation), so the rendered hand doesn't drop out or restart.
+///
+/// False positives: a palm must score 0.75; a new hand must score 0.8 presence on three consecutive
+/// frames before it is reported (0.6 keeps a confirmed hand), be within arm's reach (~0.9 m, from its
+/// palm's least-foreshortened segment) and point the way the user's own hands can (fingers not down).
 ///
 /// Runs on its own queue; a frame is skipped while the previous one is still being processed.
 final class HandTracker {
     static let jointCount = 21
-    static let inputSize = 256
+    static let inputSize = 256                 // palm detector input
 
     struct Hand {
         var id: Int
@@ -58,21 +63,73 @@ final class HandTracker {
         var region: Region
         var chirality: Int              // 0 left, 1 right; locked when the track starts
         var wristX: Float
-        var age = 1                     // consecutive frames found
+        var lastSeen: Double            // capture time the hand was last found
+        var velocity = SIMD2<Float>.zero    // region centre, image px/s
+        var age = 1                     // frames found (kept through a coast)
+
+        var confirmed: Bool { age >= HandTracker.confirmFrames }
+
+        /// Where to look at `time`: moved along the hand's velocity, grown by the distance moved
+        /// (up to 1.5x) so a mis-predicted fast hand still lands in the crop.
+        func predicted(at time: Double) -> Region {
+            let shift = velocity * Float(min(max(time - lastSeen, 0), 0.1))
+            var r = region
+            r.centre += shift
+            r.size *= 1 + min(simd_length(shift) / region.size, 0.5)
+            return r
+        }
+
+        mutating func found(_ next: Region, wristX: Float, at time: Double) {
+            let dt = Float(time - lastSeen)
+            if dt > 0, dt < 0.3 {
+                let v = (next.centre - region.centre) / dt
+                velocity = age > 1 ? velocity + (v - velocity) * 0.7 : v
+            } else {
+                velocity = .zero
+            }
+            region = next
+            self.wristX = wristX
+            lastSeen = time
+            age += 1
+        }
     }
 
     private static let palmThreshold: Float = 0.75
     private static let newHandPresence: Float = 0.8
     private static let trackingPresence: Float = 0.6
     private static let maxReach: Float = 0.9            // m: farther hands aren't the user's
-    private static let palmLength: Float = 0.083        // m, wrist to middle-finger knuckle
+    private static let maxTilt: Float = 2.2             // rad from fingers-up: the user's hands don't point down
+    private static let confirmFrames = 3
+    private static let coastTime = 0.25                 // s a lost hand can be picked up again as itself
     private static let maxHands = 2
+    private static let maxPalms = 4                     // palm regions considered per detector run
+
+    /// Since launch, for the HUD/log: how a second hand gets found, or why it doesn't.
+    struct NewHandCounts {
+        var palmRuns = 0            // palm detector runs while one hand was tracked
+        var palmMisses = 0          // ... that found no palm away from the tracked hand
+        var started = 0             // new-hand tracks started (passed the checks once)
+        var confirmed = 0           // ... that passed them on `confirmFrames` frames and were shown
+        var rejectPresence = 0      // new-hand checks failed: landmark presence below `newHandPresence`
+        var rejectReach = 0         // ... farther than `maxReach`
+        var rejectTilt = 0          // ... fingers pointing down
+
+        static func += (a: inout NewHandCounts, b: NewHandCounts) {
+            a.palmRuns += b.palmRuns; a.palmMisses += b.palmMisses; a.started += b.started
+            a.confirmed += b.confirmed; a.rejectPresence += b.rejectPresence; a.rejectReach += b.rejectReach
+            a.rejectTilt += b.rejectTilt
+        }
+    }
 
     private let queue = DispatchQueue(label: "hands.mediapipe", qos: .userInitiated)
     private let lock = NSLock()
     private var busy = false
     private var _enabled = true
+    private var _flipped = false
     private var latest: Detection?
+    private var regained = 0            // lost hands picked up again as themselves
+    private var dropped = 0             // confirmed hands lost for good
+    private var newHands = NewHandCounts()
     private var sequence: UInt64 = 0
     private var processMS = 0.0
     private var rateCount = 0
@@ -82,10 +139,12 @@ final class HandTracker {
     // `queue` only
     private var detector: MLModel?
     private var landmarker: MLModel?
-    private var input: MLMultiArray?
+    private var input: MLMultiArray?            // palm detector input
+    private var landmarkInput: MLMultiArray?    // landmark model input, its own size (224 or 256)
     private var tracks: [Track] = []
     private var nextID = 0
     private var framesSinceDetection = 0
+    private var frameCounts = NewHandCounts()   // this frame's, added to `newHands` at its end
     private static let anchors = makeAnchors()
 
     init() {
@@ -100,6 +159,13 @@ final class HandTracker {
             if !newValue { latest = nil }
             lock.unlock()
         }
+    }
+
+    /// The camera image is upside down (phone the other way round in the viewer): "up" for the
+    /// fingers-not-down check is image down.
+    var flipped: Bool {
+        get { lock.lock(); defer { lock.unlock() }; return _flipped }
+        set { lock.lock(); _flipped = newValue; lock.unlock() }
     }
 
     /// Capture queue: hand the frame over unless the previous one is still being processed.
@@ -138,17 +204,18 @@ final class HandTracker {
         return latest
     }
 
-    /// (milliseconds per processed frame, processed frames per second)
-    var stats: (ms: Double, hz: Double) {
+    /// (milliseconds per processed frame, processed frames per second, lost hands regained, dropped,
+    /// how new hands fared)
+    var stats: (ms: Double, hz: Double, regained: Int, dropped: Int, newHands: NewHandCounts) {
         lock.lock()
         defer { lock.unlock() }
-        return (processMS, rate)
+        return (processMS, rate, regained, dropped, newHands)
     }
 
     // MARK: Pipeline (queue)
 
     private func process(_ frame: CameraFrame) -> [Hand]? {
-        guard let detector, let landmarker, let input else { return nil }
+        guard let detector, let landmarker, input != nil else { return nil }
         let buffer = frame.pixelBuffer
         CVPixelBufferLockBaseAddress(buffer, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
@@ -156,32 +223,74 @@ final class HandTracker {
 
         var hands: [Hand] = []
         var kept: [Track] = []
+        var coasting: [Track] = []          // confirmed hands lost this moment, may be picked up again
+        var regainedNow = 0, droppedNow = 0
+        let now = frame.captureTime
         let focal = frame.intrinsics.x
-        // 1. Tracked hands: landmarks inside last frame's region.
+        let flipped = self.flipped
+        func report(_ track: Track, _ hand: (points: [SIMD2<Float>], depths: [Float], valid: [Bool])) {
+            hands.append(Hand(id: track.id, chirality: track.chirality, points: hand.points,
+                              depths: hand.depths, valid: hand.valid))
+        }
+
+        // 1. Tracked hands: landmarks where each hand was heading. Unconfirmed ones are held to the
+        //    new-hand checks until confirmed.
         for var track in tracks {
-            guard let found = landmarks(in: track.region, image: image, model: landmarker,
-                                        presence: Self.trackingPresence, focal: focal) else { continue }
-            if kept.contains(where: { simd_distance($0.region.centre, found.next.centre) < 0.4 * $0.region.size }) {
-                continue
-            }
-            track.region = found.next
-            track.wristX = found.hand.points[0].x
-            track.age += 1
-            kept.append(track)
-            if track.age >= 2 {
-                hands.append(Hand(id: track.id, chirality: track.chirality, points: found.hand.points,
-                                  depths: found.hand.depths, valid: found.hand.valid))
+            let found = landmarks(in: track.predicted(at: now), image: image, model: landmarker,
+                                  newHand: !track.confirmed, focal: focal, flipped: flipped)
+            if let found {
+                // Two tracks on one hand: the older one (earlier in `tracks`) keeps it, this one ends.
+                // Not coasting: it isn't lost, and a coasting track would hold the second hand's place
+                // and keep the palm detector running for nothing.
+                if kept.contains(where: { simd_distance($0.region.centre, found.next.centre) < 0.4 * $0.region.size }) {
+                    continue
+                }
+                track.found(found.next, wristX: found.hand.points[0].x, at: now)
+                kept.append(track)
+                if track.age == Self.confirmFrames { frameCounts.confirmed += 1 }
+                if track.confirmed { report(track, found.hand) }
+            } else if track.confirmed {
+                if now - track.lastSeen < Self.coastTime { coasting.append(track) } else { droppedNow += 1 }
             }
         }
 
-        // 2. Look for new hands while fewer than two are tracked.
+        // 2. Palm detector: at once when a hand was just lost, else while fewer than two are tracked
+        //    (every frame with none, every 8th with one).
         framesSinceDetection += 1
-        if kept.count < Self.maxHands, kept.isEmpty || framesSinceDetection >= 8 {
+        if kept.count < Self.maxHands, kept.isEmpty || !coasting.isEmpty || framesSinceDetection >= 8 {
             framesSinceDetection = 0
-            for palm in palms(in: image, model: detector) where kept.count < Self.maxHands {
-                if kept.contains(where: { simd_distance($0.region.centre, palm.centre) < 0.5 * $0.region.size }) { continue }
-                guard let found = landmarks(in: palm, image: image, model: landmarker,
-                                            presence: Self.newHandPresence, focal: focal) else { continue }
+            func tracked(_ palm: Region) -> Bool {
+                kept.contains(where: { simd_distance($0.region.centre, palm.centre) < 0.5 * $0.region.size })
+            }
+            let detected = palms(in: image, model: detector)
+            if kept.count == 1 {
+                frameCounts.palmRuns += 1
+                if detected.allSatisfy(tracked) { frameCounts.palmMisses += 1 }
+            }
+            for palm in detected where kept.count < Self.maxHands {
+                if tracked(palm) { continue }       // also hands added earlier in this loop
+
+                // A lost hand showing up near where it was heading: it is that hand.
+                let nearest = coasting.indices.min {
+                    simd_distance(coasting[$0].predicted(at: now).centre, palm.centre)
+                        < simd_distance(coasting[$1].predicted(at: now).centre, palm.centre)
+                }
+                if let i = nearest,
+                   simd_distance(coasting[i].predicted(at: now).centre, palm.centre) < 1.5 * coasting[i].region.size {
+                    guard let found = landmarks(in: palm, image: image, model: landmarker, newHand: false,
+                                                focal: focal, flipped: flipped) else { continue }
+                    var track = coasting.remove(at: i)
+                    track.found(found.next, wristX: found.hand.points[0].x, at: now)
+                    kept.append(track)
+                    report(track, found.hand)
+                    regainedNow += 1
+                    continue
+                }
+
+                // A new hand, while there is room for one (coasting hands keep their place).
+                guard kept.count + coasting.count < Self.maxHands,
+                      let found = landmarks(in: palm, image: image, model: landmarker, newHand: true,
+                                            focal: focal, flipped: flipped) else { continue }
                 // Evidence for "right hand", each in -1...1: the model, wrist right of centre, and
                 // the hand leaning left (rotation < 0 means fingers point up-left).
                 let model = (found.rightness - 0.5) * 2
@@ -189,35 +298,48 @@ final class HandTracker {
                 let lean = min(max(-sin(found.next.rotation) * 2, -1), 1)
                 let right = 0.3 * model + 0.4 * side + 0.3 * lean > 0
                 var chirality = right ? 1 : 0
-                if let other = kept.first, other.chirality == chirality {
+                if (kept + coasting).contains(where: { $0.chirality == chirality }) {
                     chirality = 1 - chirality          // the established hand keeps its side
                 }
                 kept.append(Track(id: nextID, region: found.next, chirality: chirality,
-                                  wristX: found.hand.points[0].x))
-                nextID += 1                 // reported from its second frame on
+                                  wristX: found.hand.points[0].x, lastSeen: now))
+                nextID += 1                 // reported once confirmed
+                frameCounts.started += 1
             }
         }
-        tracks = kept
+        tracks = kept + coasting
+        lock.lock()
+        regained += regainedNow
+        dropped += droppedNow
+        newHands += frameCounts
+        lock.unlock()
+        frameCounts = NewHandCounts()
         return hands
     }
 
     /// Landmark model on one region: the hand in image pixels, the region for the next frame, and
-    /// P(right hand). Nil when the model says there is no hand.
-    private func landmarks(in region: Region, image: Image, model: MLModel, presence threshold: Float, focal: Float)
+    /// P(right hand). Nil when the model says there is no hand; for a `newHand`, also when it isn't
+    /// clearly one of the user's own (presence, reach, direction).
+    private func landmarks(in region: Region, image: Image, model: MLModel, newHand: Bool, focal: Float, flipped: Bool)
         -> (hand: (points: [SIMD2<Float>], depths: [Float], valid: [Bool]), next: Region, rightness: Float)? {
-        guard let input else { return nil }
-        let size = Float(Self.inputSize)
+        let threshold = newHand ? Self.newHandPresence : Self.trackingPresence
+        guard let input = landmarkInput else { return nil }
+        let size = Float(input.shape[3].intValue)
         let c = cos(region.rotation), s = sin(region.rotation)
         let step = region.size / (size - 1)
         // Crop pixel (u, v) -> image: centre + R * ((u, v) * step - size / 2).
         let half = region.size / 2
         let m: [Float] = [c * step, -s * step, region.centre.x - c * half + s * half,
                           s * step, c * step, region.centre.y - s * half - c * half]
-        image.crop(m, into: input)
+        image.crop(m, size: Int(size), into: input)
         guard let output = try? model.prediction(from: Self.features(input)),
-              let presence = output.featureValue(for: "scores")?.multiArrayValue.map({ Self.read($0)[0] }),
-              presence >= threshold,
-              let lr = output.featureValue(for: "lr")?.multiArrayValue.map({ Self.read($0)[0] }),
+              let presence = output.featureValue(for: "scores")?.multiArrayValue.map({ Self.read($0)[0] })
+        else { return nil }
+        guard presence >= threshold else {
+            if newHand { frameCounts.rejectPresence += 1 }
+            return nil
+        }
+        guard let lr = output.featureValue(for: "lr")?.multiArrayValue.map({ Self.read($0)[0] }),
               let raw = output.featureValue(for: "landmarks")?.multiArrayValue.map({ Self.read($0) }),
               raw.count >= 63
         else { return nil }
@@ -229,11 +351,28 @@ final class HandTracker {
             points[i] = region.centre + SIMD2(c * local.x - s * local.y, s * local.x + c * local.y)
             depths[i] = raw[3 * i + 2] * region.size
         }
-        // Within arm's reach? (The palm's image length gives its distance.)
-        let palmPixels = simd_distance(points[0], points[9])
-        guard palmPixels > 1, Self.palmLength * focal / palmPixels < Self.maxReach else { return nil }
+        let next = Self.region(fromLandmarks: points)
+        if newHand {
+            // Within arm's reach? Each palm segment's image length gives a distance; foreshortening
+            // (a fist pointing at the camera) only makes one look farther, so the nearest counts.
+            var distance = Float.infinity
+            for (a, b, length) in HandModel.palmSegments {
+                let pixels = simd_distance(points[a], points[b])
+                if pixels > 1 { distance = min(distance, length * focal / pixels) }
+            }
+            guard distance < Self.maxReach else {
+                frameCounts.rejectReach += 1
+                return nil
+            }
+            // The user's own hands point up or sideways in their view, not down.
+            let up = (next.rotation + (flipped ? Float.pi : 0)).remainder(dividingBy: 2 * .pi)
+            guard abs(up) < Self.maxTilt else {
+                frameCounts.rejectTilt += 1
+                return nil
+            }
+        }
         let hand = (points: points, depths: depths, valid: [Bool](repeating: true, count: Self.jointCount))
-        return (hand, Self.region(fromLandmarks: points), lr)
+        return (hand, next, lr)
     }
 
     /// Palm detector on the whole frame (letterboxed to 256x256): regions for the landmark model.
@@ -242,7 +381,7 @@ final class HandTracker {
         let size = Float(Self.inputSize)
         let scale = min(size / Float(image.width), size / Float(image.height))
         let pad = (SIMD2(size, size) - SIMD2(Float(image.width), Float(image.height)) * scale) / 2
-        image.crop([1 / scale, 0, -pad.x / scale, 0, 1 / scale, -pad.y / scale], into: input)
+        image.crop([1 / scale, 0, -pad.x / scale, 0, 1 / scale, -pad.y / scale], size: Self.inputSize, into: input)
         guard let output = try? model.prediction(from: Self.features(input)),
               let coordsArray = output.featureValue(for: "box_coords")?.multiArrayValue,
               let scoresArray = output.featureValue(for: "box_scores")?.multiArrayValue
@@ -269,8 +408,10 @@ final class HandTracker {
 
         // Weighted non-maximum suppression (MediaPipe's): merge overlapping boxes by score.
         candidates.sort { $0.score > $1.score }
+        // Not capped at `maxHands`: the caller skips palms of hands it already tracks, and a tracked
+        // hand (or a stronger false palm) must not use up the slot of the second hand's palm.
         var regions: [Region] = []
-        while let best = candidates.first, regions.count < Self.maxHands {
+        while let best = candidates.first, regions.count < Self.maxPalms {
             var cluster: [(score: Float, values: [Float])] = []
             var rest: [(score: Float, values: [Float])] = []
             for candidate in candidates {
@@ -328,7 +469,10 @@ final class HandTracker {
             landmarker = try MLModel(contentsOf: try Self.compiledModel("HandLandmarks"), configuration: configuration)
             input = try MLMultiArray(shape: [1, 3, NSNumber(value: Self.inputSize), NSNumber(value: Self.inputSize)],
                                      dataType: .float32)
-            Log.info("hands: MediaPipe models loaded (Neural Engine)")
+            let shape = landmarker?.modelDescription.inputDescriptionsByName["image"]?.multiArrayConstraint?.shape
+            let side = shape?.last ?? NSNumber(value: Self.inputSize)
+            landmarkInput = try MLMultiArray(shape: [1, 3, side, side], dataType: .float32)
+            Log.info("hands: MediaPipe models loaded (Neural Engine), landmarks \(side)x\(side)")
         } catch {
             Log.info("hands: model load failed: \(error.localizedDescription)")
         }
@@ -445,10 +589,10 @@ final class HandTracker {
             height = CVPixelBufferGetHeightOfPlane(buffer, 0)
         }
 
-        func crop(_ m: [Float], into input: MLMultiArray) {
+        func crop(_ m: [Float], size: Int, into input: MLMultiArray) {
             m.withUnsafeBufferPointer { affine in
                 weee_crop_rgb(luma, Int32(lumaStride), chroma, Int32(chromaStride), Int32(width), Int32(height),
-                              affine.baseAddress, Int32(HandTracker.inputSize),
+                              affine.baseAddress, Int32(size),
                               input.dataPointer.assumingMemoryBound(to: Float.self))
             }
         }

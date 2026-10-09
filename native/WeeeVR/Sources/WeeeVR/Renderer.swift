@@ -19,6 +19,8 @@ struct Uniforms {
     var head = SIMD4<Float>(0, 0, 0, 1.5)
     var cube = SIMD4<Float>()
     var hud = SIMD4<Float>()
+    var image = SIMD4<Float>()      // YCbCr matrix (0 BT.601, 1 BT.709), sharpening, black lift, edge softness
+    var chroma = SIMD4<Float>()     // red / blue tan-angle scale - 1 (lens CA), P3 colour fix (0/1), 0
 
     mutating func setCameraFromWorld(_ m: simd_float3x3) {
         camRot0 = SIMD4(m.columns.0, 0); camRot1 = SIMD4(m.columns.1, 0); camRot2 = SIMD4(m.columns.2, 0)
@@ -72,6 +74,7 @@ final class Renderer {
     /// Encodes and presents one frame. `frame` is retained until the GPU has finished with it.
     /// `completed` reports the GPU execution time (seconds).
     func draw(to drawable: CAMetalDrawable, frame: CameraFrame?, uniforms: Uniforms, hands: [SIMD4<Float>],
+              scene: [SIMD4<Float>],
               presented: @escaping (Double) -> Void, completed: @escaping (Double) -> Void) {
         guard let commandBuffer = queue.makeCommandBuffer() else { return }
 
@@ -90,6 +93,7 @@ final class Renderer {
                 encoder.setRenderPipelineState(pipeline)
                 encoder.setFragmentBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 0)
                 hands.withUnsafeBytes { encoder.setFragmentBytes($0.baseAddress!, length: $0.count, index: 1) }
+                scene.withUnsafeBytes { encoder.setFragmentBytes($0.baseAddress!, length: $0.count, index: 2) }
                 encoder.setFragmentTexture(luma, index: 0)
                 encoder.setFragmentTexture(chroma, index: 1)
                 encoder.setFragmentTexture(hud, index: 2)
