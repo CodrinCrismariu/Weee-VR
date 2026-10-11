@@ -8,6 +8,8 @@
 	<string>The camera is used for headset passthrough.</string>
 	<key>NSMotionUsageDescription</key>
 	<string>Motion sensors are used for head tracking.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>The smart ping pong paddle streams its motion over the local Wi-Fi.</string>
 	<key>UIDeviceFamily</key>
 	<array>
 		<integer>1</integer>

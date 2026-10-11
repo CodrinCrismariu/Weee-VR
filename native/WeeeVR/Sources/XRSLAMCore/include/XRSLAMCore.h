@@ -88,6 +88,34 @@ void weee_slam_reloc_step(WeeeSLAM *slam);
 void weee_crop_rgb(const uint8_t *luma, int luma_stride, const uint8_t *chroma, int chroma_stride,
                    int width, int height, const float m[6], int size, float *out);
 
+/// The smart paddle's AprilTag (tagStandard41h12) in a camera image, with its pose.
+typedef struct {
+    int id;
+    int hamming;                    // bits corrected
+    float margin;                   // decode margin
+    double centre[2];               // undistorted image pixels
+    double corners[8];              // undistorted image pixels, AprilTag order (x0 y0 x1 y1 ...)
+    int solutions;                  // 1 or 2 (the planar pose ambiguity)
+    double rotation[2][9];          // camera <- tag, OpenCV camera frame (x right, y down, z forward)
+    double translation[2][3];       // tag centre in the camera frame, metres
+    double error[2];                // object-space error of each solution
+} WeeeTagDetection;
+
+typedef struct WeeeTagDetector WeeeTagDetector;
+
+WeeeTagDetector *weee_tag_create(int threads);
+void weee_tag_destroy(WeeeTagDetector *detector);
+/// Looks for the tags `ids` (black-square sizes `sizes`, m) in the `w` x `h` rectangle at (`x0`, `y0`)
+/// of an 8-bit image (quads found at 1/`decimate` resolution, decoded at full). Corners are undistorted
+/// with the radtan model (`camera` = fx, fy, cx, cy in these pixels; `distortion` = k1, k2, p1, p2)
+/// before each pose is estimated. Fills up to `max_out` of `out` (one per ID) and returns how many.
+int weee_tag_detect(WeeeTagDetector *detector, const uint8_t *image, int stride, int x0, int y0, int w, int h,
+                    float decimate, const int *ids, const double *sizes, int id_count, const double camera[4],
+                    const double distortion[4], WeeeTagDetection *out, int max_out);
+/// Diagnostics: the IDs of every tag (any ID, this family) the last detect call decoded; returns how
+/// many (at most `max` are written).
+int weee_tag_last_ids(const WeeeTagDetector *detector, int *ids, int max);
+
 #ifdef __cplusplus
 }
 #endif

@@ -18,7 +18,7 @@ enum ShaderSource {
     struct Uniforms {
         float4 screen;      // drawable width px, height px, pixels per metre, screen-to-lens metres
         float4 lens;        // left lens centre x px, lens centre y px, right lens centre x px, max tan-angle
-        float4 optics;      // k1, k2, fovScale, flags (1 grid, 2 cube, 4 hud, 8 hands)
+        float4 optics;      // k1, k2, fovScale, flags (1 grid, 2 cube, 4 hud, 8 hands, 16 game)
         float4 camK;        // fx, fy, cx, cy in camera-buffer pixels
         float4 cam;         // buffer width, buffer height, ipd metres, flip (0/1)
         float4 camRot0, camRot1, camRot2;   // camera <- world at capture time (columns)
@@ -40,7 +40,7 @@ enum ShaderSource {
         return o;
     }
 
-    // Hands: HandModel.stride float4 per hand -- [0] valid, bone radius scale, 0, chirality;
+    // Hands: HandModel.stride float4 per hand -- [0] valid, bone radius scale, highlight, chirality;
     // [1] world bounding sphere; [2..22] world joints (w = valid).
     constant int kHandStride = 23;
     constant int2 kBones[23] = {
@@ -73,22 +73,27 @@ enum ShaderSource {
         return -1.0;
     }
 
-    // Camera texture coordinate of what the eye at `eye` sees in eye-space direction `tanEye`: the ray
-    // hits the depth-proxy sphere around the eyes, and that point is projected into the camera at its
-    // capture pose. False when it falls outside the camera image.
-    static bool cameraUV(float2 tanEye, float3 eye, constant Uniforms& u, float3x3 worldFromView,
-                         float3x3 camFromWorld, thread float2& uv) {
-        float3 ray = normalize(worldFromView * normalize(float3(tanEye * u.optics.z, -1.0)));
-        float3 rel = eye - u.head.xyz;
-        float b = dot(ray, rel);
-        float c = dot(rel, rel) - u.head.w * u.head.w;
-        float t = -b + sqrt(max(b * b - c, 0.0));
-        float3 camRay = camFromWorld * (eye + ray * t - u.camPos.xyz);
+    // Camera texture coordinate of world point `p` (false: behind the camera).
+    static bool projectToCamera(float3 p, constant Uniforms& u, float3x3 camFromWorld, thread float2& uv) {
+        float3 camRay = camFromWorld * (p - u.camPos.xyz);
         if (camRay.z >= -1e-3) return false;
         float2 tanCam = camRay.xy / -camRay.z;
         uv = float2(u.camK.x * tanCam.x + u.camK.z, u.camK.w - u.camK.y * tanCam.y) / u.cam.xy;
         if (u.cam.w > 0.5) { uv = 1.0 - uv; }
-        return all(uv >= 0.0) && all(uv <= 1.0);
+        return true;
+    }
+
+    // The eye's ray (world) through eye-space direction `tanEye`.
+    static float3 eyeRay(float2 tanEye, constant Uniforms& u, float3x3 worldFromView) {
+        return normalize(worldFromView * normalize(float3(tanEye * u.optics.z, -1.0)));
+    }
+
+    // Distance along the eye's ray to the depth-proxy sphere around the eyes (no depth map).
+    static float sphereDistance(float3 eye, float3 ray, constant Uniforms& u) {
+        float3 rel = eye - u.head.xyz;
+        float b = dot(ray, rel);
+        float c = dot(rel, rel) - u.head.w * u.head.w;
+        return -b + sqrt(max(b * b - c, 0.0));
     }
 
     // Camera luma at `uv`. With `amount` > 0: Catmull-Rom bicubic (5 bilinear taps, corners dropped)
@@ -131,10 +136,11 @@ enum ShaderSource {
             : float3(y + 1.402 * cbcr.y, y - 0.344136 * cbcr.x - 0.714136 * cbcr.y, y + 1.772 * cbcr.x);
         rgb = saturate(rgb);
         if (u.chroma.z > 0.5) {
-            float3 lin = select(pow((rgb + 0.055) / 1.055, 2.4), rgb / 12.92, rgb <= 0.04045);
-            lin = float3x3(float3(0.8225, 0.0332, 0.0171), float3(0.1774, 0.9669, 0.0724),
-                           float3(0.0, 0.0, 0.9108)) * lin;
-            rgb = select(1.055 * pow(lin, 1.0 / 2.4) - 0.055, lin * 12.92, lin <= 0.0031308);
+            // Linear light approximated by gamma 2 (a square and a square root instead of the sRGB
+            // curve's powers, per pixel): greys stay exact, saturated colours within a percent or so.
+            float3 lin = float3x3(float3(0.8225, 0.0332, 0.0171), float3(0.1774, 0.9669, 0.0724),
+                                  float3(0.0, 0.0, 0.9108)) * (rgb * rgb);
+            rgb = sqrt(max(lin, 0.0));
         }
         return rgb;
     }
@@ -483,16 +489,21 @@ enum ShaderSource {
         // so with a correction set each channel is looked up along its own direction; the overlays
         // below use the green one.
         float3 col = float3(0.05);
+        float3 rayGreen = eyeRay(tanEye, u, worldFromView);
+        float seen = sphereDistance(eye, rayGreen, u);
         float2 uv;
-        bool green = cameraUV(tanEye, eye, u, worldFromView, camFromWorld, uv);
+        bool green = projectToCamera(eye + rayGreen * seen, u, camFromWorld, uv) && all(uv >= 0.0) && all(uv <= 1.0);
         if (all(u.chroma.xy == 0.0)) {
             if (green) { col = cameraRGB(lumaTex, chromaTex, s, uv, u); }
         } else {
+            // The red and blue rays use the green ray's distance to the sphere.
             if (green) { col.g = cameraRGB(lumaTex, chromaTex, s, uv, u).g; }
-            if (cameraUV(tanEye * (1.0 + u.chroma.x), eye, u, worldFromView, camFromWorld, uv)) {
+            float3 rayRed = eyeRay(tanEye * (1.0 + u.chroma.x), u, worldFromView);
+            if (projectToCamera(eye + rayRed * seen, u, camFromWorld, uv) && all(uv >= 0.0) && all(uv <= 1.0)) {
                 col.r = cameraRGB(lumaTex, chromaTex, s, uv, u).r;
             }
-            if (cameraUV(tanEye * (1.0 + u.chroma.y), eye, u, worldFromView, camFromWorld, uv)) {
+            float3 rayBlue = eyeRay(tanEye * (1.0 + u.chroma.y), u, worldFromView);
+            if (projectToCamera(eye + rayBlue * seen, u, camFromWorld, uv) && all(uv >= 0.0) && all(uv <= 1.0)) {
                 col.b = cameraRGB(lumaTex, chromaTex, s, uv, u).b;
             }
         }
@@ -581,6 +592,7 @@ enum ShaderSource {
                     float3 ab = b - a;
                     float3 n = normalize(hp - (a + ab * saturate(dot(hp - a, ab) / max(dot(ab, ab), 1e-8))));
                     float3 base = hand[0].w > 0.5 ? float3(0.35, 1.0, 0.6) : float3(0.3, 0.75, 1.0);
+                    base = mix(base, float3(1.0, 0.85, 0.35), hand[0].z);       // a gesture charging
                     float lambert = 0.35 + 0.65 * saturate(dot(n, -worldRay));
                     float rim = pow(1.0 - saturate(dot(n, -worldRay)), 3.0);
                     handT = best;
@@ -588,7 +600,7 @@ enum ShaderSource {
                 }
             }
             // In front of the scene only: a hand behind the paddle or the table is hidden by it.
-            if (handT < sceneT) { col = mix(col, handCol, (flags & 16) ? 0.95 : 0.85); }
+            if (handT < sceneT) { col = mix(col, handCol, 0.85); }
         }
 
         if (netT > 0.0 && netT < min(sceneT, handT)) {
@@ -597,6 +609,34 @@ enum ShaderSource {
             bool cord = netQ.y < 0.005;
             float3 netCol = band ? float3(0.93) : float3(0.03, 0.04, 0.05);
             col = mix(col, netCol, band || cord ? 1.0 : 0.55);
+        }
+
+        if ((flags & 16) && scene[12].w > 0.0) {
+            // Smart paddle: the calibration ring around the big tag where the camera sees it.
+            float pixel = u.optics.z / (u.screen.z * u.screen.w) * (1.0 + 3.0 * u.optics.x * r2 + 5.0 * u.optics.y * r2 * r2);
+            float ring = scene[13].w;
+            float3 c0 = scene[12].xyz, c1 = scene[13].xyz, c2 = scene[14].xyz, c3 = scene[15].xyz;
+            if (ring > -0.5) {
+                // Ring around the tag in its plane, filling clockwise from the top as views come in.
+                float3 centre = (c0 + c1 + c2 + c3) * 0.25;
+                float3 e1 = normalize(c1 - c0), n = normalize(cross(c1 - c0, c3 - c0));
+                float3 e2 = cross(n, e1);
+                float denom = dot(worldRay, n);
+                if (abs(denom) > 1e-4) {
+                    float t = dot(centre - eye, n) / denom;
+                    float3 q = eye + worldRay * t - centre;
+                    float radiusTag = length(c0 - centre);
+                    float rq = length(q) / radiusTag;
+                    float band = saturate((0.12 - abs(rq - 1.45)) * radiusTag / (pixel * max(t, 1e-3)) + 0.5);
+                    if (t > 0.0 && band > 0.0) {
+                        float frac = fract(atan2(dot(q, e1), dot(q, -e2)) / (2.0 * M_PI_F) + 1.0);
+                        float filled = ring >= 1.5 ? 1.0 : step(frac, ring);
+                        float3 ringCol = ring >= 2.5 ? float3(1.0, 0.25, 0.2)
+                                       : ring >= 1.5 ? float3(0.25, 1.0, 0.45) : float3(1.0, 0.82, 0.25);
+                        col = mix(col, mix(float3(0.25), ringCol, filled), band * 0.9);
+                    }
+                }
+            }
         }
 
         if (flags & 4) {

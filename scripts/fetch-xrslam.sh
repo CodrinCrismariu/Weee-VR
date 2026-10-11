@@ -17,6 +17,7 @@ XRSLAM_REV=4beb1a942f33da9afbfae2d70e2c641cfc2bb675   # openxrlab/xrslam, Feb 20
 CERES_REV=e809cf0c2879f521078b4c9e6329390b42ecf722    # Ceres 1.14 + std::function fix (XRSLAM's pin)
 EIGEN_TAG=3.3.7
 OPENCV_VERSION=4.10.0
+APRILTAG_TAG=v3.4.5                                     # AprilRobotics/apriltag, smart paddle tag
 
 mkdir -p "$CACHE"
 
@@ -39,6 +40,7 @@ echo "== sources"
 git_at xrslam https://github.com/openxrlab/xrslam.git "$XRSLAM_REV"
 git_at ceres https://github.com/ceres-solver/ceres-solver.git "$CERES_REV"
 git_at eigen https://github.com/eigenteam/eigen-git-mirror.git "$EIGEN_TAG"
+git_at apriltag https://github.com/AprilRobotics/apriltag.git "$APRILTAG_TAG"
 
 echo "== patches"
 for p in "$HERE"/patches/*.diff; do
@@ -91,10 +93,31 @@ cp -r "$X/xrslam-extra/include/xrslam" "$OUT/xrslam/extra/include/"
 cp "$X/xrslam-extra/src/xrslam/extra/opencv_image.cpp" "$OUT/xrslam/extra/src/"
 rm "$OUT/xrslam/extra/include/xrslam/extra/yaml_config.h"   # needs yaml-cpp; we configure from code
 
+echo "== AprilTag $APRILTAG_TAG (core + tagStandard41h12)"
+A="$CACHE/apriltag"
+mkdir -p "$OUT/apriltag/src/common" "$OUT/apriltag/include/common"
+cp "$A"/apriltag.c "$A"/apriltag_pose.c "$A"/apriltag_quad_thresh.c "$A"/tagStandard41h12.c "$OUT/apriltag/src/"
+cp "$A"/common/*.c "$OUT/apriltag/src/common/"
+# Headers next to the sources (they include each other relatively) and as the public interface.
+for d in src include; do
+    cp "$A"/apriltag.h "$A"/apriltag_math.h "$A"/apriltag_pose.h "$A"/tagStandard41h12.h "$OUT/apriltag/$d/"
+    cp "$A"/common/*.h "$OUT/apriltag/$d/common/"
+done
+# Only what Sources/XRSLAMCore/TagDetect.c uses; some common headers aren't standalone.
+cat > "$OUT/apriltag/include/module.modulemap" <<'MAP'
+module AprilTag {
+    header "apriltag.h"
+    header "apriltag_pose.h"
+    header "tagStandard41h12.h"
+    export *
+}
+MAP
+
 cat > "$OUT/VERSIONS.txt" <<EOF
 xrslam   $XRSLAM_REV  (Apache-2.0)
 ceres    $CERES_REV   (BSD-3-Clause)
 eigen    $EIGEN_TAG   (MPL-2.0; Ceres' Eigen sparse backend uses Eigen's LGPL AMD ordering)
 opencv   $OPENCV_VERSION (Apache-2.0)
+apriltag $APRILTAG_TAG (BSD-2-Clause)
 EOF
 echo "== done: $OUT ($(du -sh "$OUT" | cut -f1))"

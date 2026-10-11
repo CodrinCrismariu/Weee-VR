@@ -1,15 +1,16 @@
 import Foundation
 
-/// Physical description of the Cardboard viewer + phone screen, plus user toggles.
-/// Defaults are Google Cardboard v2 ("Cardboard I/O 2015") on an iPhone 15.
+/// Physical description of the phone viewer (headset) + phone screen, plus user toggles.
+/// Defaults are the VRG Pro (`Headset.vrgPro`) on an iPhone 15.
 struct ViewerProfile: Codable, Equatable {
-    // Viewer optics
-    var interLensMM: Float = 63.9
-    var screenToLensMM: Float = 39.0
-    var trayToLensMM: Float = 35.0
-    var k1: Float = 0.34
-    var k2: Float = 0.55
-    var lensFovDeg: Float = 50          // half-angle visible through each lens
+    // Viewer optics (`Headset` presets; the sliders fine-tune them)
+    var headset = Headset.vrgPro
+    var interLensMM: Float = 63.0
+    var screenToLensMM: Float = 42.0
+    var trayToLensMM: Float = 36.0
+    var k1: Float = 0.38
+    var k2: Float = 0.40
+    var lensFovDeg: Float = 55          // half-angle visible through each lens
 
     // Phone
     var screenPPI: Float = 460          // iPhone 15
@@ -21,12 +22,12 @@ struct ViewerProfile: Codable, Equatable {
     var flipCamera = false              // rotate camera image 180° if the phone sits the other way round
     var predictionMS: Float = 4         // extra pose prediction past the target present time (scan-out)
 
-    // Camera vs eyes: midpoint between the eyes relative to the passthrough camera, in the landscape
-    // view frame (x right, y up, z toward the viewer). iPhone 15 main camera in a Cardboard: the camera
-    // is ~48 mm left of, ~11 mm above and ~62 mm in front of the eyes.
+    // Camera vs eyes: midpoint between the eyes relative to the iPhone 15's 1× camera, in the landscape
+    // view frame (x right, y up, z toward the viewer). In a Cardboard the camera is ~48 mm left of,
+    // ~11 mm above and ~62 mm in front of the eyes; the VRG Pro holds the phone ~10 mm farther out.
     var eyeOffsetXMM: Float = 48
     var eyeOffsetYMM: Float = -11
-    var eyeOffsetZMM: Float = 62
+    var eyeOffsetZMM: Float = 72
 
     // Depth proxy: the camera image is projected onto a sphere this far from the eyes, then viewed
     // from each eye's real position. Auto follows ARKit's feature points.
@@ -46,7 +47,7 @@ struct ViewerProfile: Codable, Equatable {
     var slamKeypoints: Float = 300
     var slamWindow: Float = 10          // sliding-window keyframes (XRSLAM's benchmark setting; its iOS app used 5)
     var slamDefaultsVersion = 2         // bump to reset saved slam* values to new defaults
-    var defaultsVersion = 4             // bump (and list keys in `resetOnUpgrade`) to push new defaults
+    var defaultsVersion = 7             // bump (and list keys in `resetOnUpgrade`) to push new defaults
 
     // Hands (Vision hand pose -> 3D hands)
     var handTracking = true
@@ -73,9 +74,47 @@ struct ViewerProfile: Codable, Equatable {
     var floatingServe = true            // a new ball hovers at serve height, ready to hit
     var gripAngleDeg: Float = 40        // paddle blade from the knuckle direction toward the thumb
     var gripOffsetMM: Float = -12       // blade plane along the palm normal (- = into the fist)
-    var paddlePrediction: Float = 0.08  // s the hands are predicted ahead (toward display time)
+    var paddlePrediction: Float = 0     // s the 3D hands lead the camera image (0: exactly on it)
     var gameVolume: Float = 0.8
-    var shortExposure = false           // camera exposure capped (sharper hands in fast swings, noisier)
+    var maxExposureMS: Float = 5        // camera exposure cap (auto below it): less motion blur, more grain; 17 = off
+
+    // Smart paddle (ArduinoApps/smart-paddle): IMU + AprilTag paddle with haptics, over Wi-Fi
+    var smartPaddle = true              // play with it whenever it's connected and calibrated
+    var paddleHost = "10.243.94.25"     // the board's address
+    var paddleHaptics: Float = 0.8      // buzz strength on a hit (0 = off)
+    var paddleTagTurns = -1             // the tag's quarter turns on the blade; -1 = as calibrated
+    // Its calibration ("Calibrate paddle", once): IMU <- tag rotation (w x y z; empty = none), clock
+    // offset, tag turns and fit residual.
+    var paddleMount: [Double] = []
+    var paddleClockOffsetMS: Double = 0
+    var paddleCalTurns = 0
+    var paddleCalResidualDeg: Double = 0
+    var paddleSmallTags: [Int] = []     // learned: ID, quarter turns, ID, quarter turns (forehand tags 68, 69)
+
+    var paddleSmallTagTurns: [Int: Int] {
+        get {
+            var out: [Int: Int] = [:]
+            for i in Swift.stride(from: 0, to: paddleSmallTags.count - 1, by: 2) { out[paddleSmallTags[i]] = paddleSmallTags[i + 1] }
+            return out
+        }
+        set { paddleSmallTags = newValue.sorted { $0.key < $1.key }.flatMap { [$0.key, $0.value] } }
+    }
+
+    var paddleCalibration: PaddleCalibration? {
+        get {
+            paddleMount.count == 4 ? PaddleCalibration(mount: paddleMount, timeOffset: paddleClockOffsetMS / 1000,
+                                                       tagTurns: paddleCalTurns, residualDeg: paddleCalResidualDeg) : nil
+        }
+        set {
+            paddleMount = newValue?.mount ?? []
+            paddleClockOffsetMS = (newValue?.timeOffset ?? 0) * 1000
+            paddleCalTurns = newValue?.tagTurns ?? 0
+            paddleCalResidualDeg = newValue?.residualDeg ?? 0
+        }
+    }
+
+    /// The exposure cap in seconds, nil when off.
+    var exposureCap: Double? { maxExposureMS < 16.5 ? Double(maxExposureMS) / 1000 : nil }
 
     private static let storageKey = "viewerProfile.v2"
 
@@ -83,7 +122,25 @@ struct ViewerProfile: Codable, Equatable {
     private static let resetOnUpgrade: [Int: [String]] = [
         3: ["passthrough", "showGrid"],     // XRSLAM 0.5× by default, grid off
         4: ["passthrough"],                 // back to XRSLAM after swipe-switching was removed
+        5: Headset.keys,                    // the VRG Pro replaced the Cardboard
+        6: ["paddlePrediction"],            // 3D hands at the camera image's moment
+        // The first paddle calibrations were learned from tag poses that sometimes flipped behind the
+        // camera: dropped, so the paddle calibrates itself again.
+        7: ["paddleMount", "paddleClockOffsetMS", "paddleCalTurns", "paddleCalResidualDeg"],
     ]
+
+    /// Switch headsets: its optics and eye position replace the current ones.
+    mutating func apply(_ preset: Headset) {
+        headset = preset
+        let o = preset.optics
+        interLensMM = o.interLensMM
+        screenToLensMM = o.screenToLensMM
+        trayToLensMM = o.trayToLensMM
+        k1 = o.k1
+        k2 = o.k2
+        lensFovDeg = o.lensFovDeg
+        eyeOffsetZMM = o.eyeOffsetZMM
+    }
 
     /// Saved values overlaid on the defaults, so fields added since the last save keep their default
     /// and removed ones are ignored instead of discarding the whole calibration.
@@ -133,6 +190,48 @@ struct ViewerProfile: Codable, Equatable {
         let y = h - (trayToLensMM - bottomBezelMM) / 1000 * pixelsPerMeter
         return (SIMD2(w / 2 - halfSeparation, y), SIMD2(w / 2 + halfSeparation, y))
     }
+}
+
+/// Phone headsets with their optics. Cardboard v2 is Google's published profile; the VRG Pro (a generic
+/// 42 mm-lens headset with IPD and focus knobs, no published profile) is estimated from its build and
+/// is meant to be fine-tuned with the sliders.
+enum Headset: String, Codable, CaseIterable {
+    case vrgPro
+    case cardboardV2
+
+    var label: String {
+        switch self {
+        case .vrgPro: "VRG Pro"
+        case .cardboardV2: "Google Cardboard v2"
+        }
+    }
+
+    struct Optics {
+        var interLensMM: Float
+        var screenToLensMM: Float
+        var trayToLensMM: Float
+        var k1: Float
+        var k2: Float
+        var lensFovDeg: Float
+        var eyeOffsetZMM: Float          // the camera's distance in front of the eyes
+    }
+
+    var optics: Optics {
+        switch self {
+        case .vrgPro:
+            // Lens spacing: set the IPD knob to your IPD and this slider to the same. The phone is
+            // clamped centred on the lenses (iPhone 15: 71.6 mm tall -> lens axis ~36 mm from its edge).
+            Optics(interLensMM: 63.0, screenToLensMM: 42.0, trayToLensMM: 36.0, k1: 0.38, k2: 0.40,
+                   lensFovDeg: 55, eyeOffsetZMM: 72)
+        case .cardboardV2:
+            Optics(interLensMM: 63.9, screenToLensMM: 39.0, trayToLensMM: 35.0, k1: 0.34, k2: 0.55,
+                   lensFovDeg: 50, eyeOffsetZMM: 62)
+        }
+    }
+
+    /// The profile fields a preset sets.
+    static let keys = ["headset", "interLensMM", "screenToLensMM", "trayToLensMM", "k1", "k2", "lensFovDeg",
+                       "eyeOffsetZMM"]
 }
 
 enum GameScene: String, Codable, CaseIterable {

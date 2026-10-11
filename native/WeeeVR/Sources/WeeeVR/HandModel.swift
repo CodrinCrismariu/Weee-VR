@@ -49,6 +49,9 @@ final class HandModel {
     }
 
     private var slots: [Slot?] = [nil, nil]
+    /// Per chirality (0 left, 1 right), 0...1: how strongly the shader lights the hand up (a gesture
+    /// in progress).
+    var highlight: [Float] = [0, 0]
     private var lastSequence: UInt64 = 0
 
     /// Integrate a detection if it is new. `pose` is world <- camera (view frame) at its capture time;
@@ -124,6 +127,7 @@ final class HandModel {
 
     func reset() { slots = [nil, nil] }
 
+
     var visibleCount: Int { slots.compactMap { $0 }.count }
 
     /// Shader data for both hands, predicted to `time` (overlay: the passthrough frame's capture time;
@@ -135,28 +139,31 @@ final class HandModel {
                 slots[h] = nil
                 continue
             }
-            let base = h * Self.stride
             let lead = slot.lost ? slot.lead : Float(min(max(displayTime - slot.time, 0), maxLead))
             slots[h]?.lead = lead
-            var joints = [SIMD3<Float>](repeating: .zero, count: HandTracker.jointCount)
-            var centre = SIMD3<Float>.zero
-            var count: Float = 0
-            for i in 0..<HandTracker.jointCount where slot.valid[i] {
-                joints[i] = slot.filters[i].predict(seconds: lead)
-                centre += joints[i]
-                count += 1
-            }
-            guard count > 0 else { continue }
-            centre /= count
-            var radius: Float = 0
-            for i in 0..<HandTracker.jointCount where slot.valid[i] {
-                out[base + 2 + i] = SIMD4(joints[i], 1)
-                radius = max(radius, simd_length(joints[i] - centre))
-            }
-            out[base + 1] = SIMD4(centre, radius + 0.02 * slot.radiusScale)
-            out[base] = SIMD4(1, slot.radiusScale, 0, Float(slot.chirality))
+            pack(slot, lead: lead, into: &out, at: h * Self.stride)
         }
         return out
+    }
+
+    private func pack(_ slot: Slot, lead: Float, into out: inout [SIMD4<Float>], at base: Int) {
+        var joints = [SIMD3<Float>](repeating: .zero, count: HandTracker.jointCount)
+        var centre = SIMD3<Float>.zero
+        var count: Float = 0
+        for i in 0..<HandTracker.jointCount where slot.valid[i] {
+            joints[i] = slot.filters[i].predict(seconds: lead)
+            centre += joints[i]
+            count += 1
+        }
+        guard count > 0 else { return }
+        centre /= count
+        var radius: Float = 0
+        for i in 0..<HandTracker.jointCount where slot.valid[i] {
+            out[base + 2 + i] = SIMD4(joints[i], 1)
+            radius = max(radius, simd_length(joints[i] - centre))
+        }
+        out[base + 1] = SIMD4(centre, radius + 0.02 * slot.radiusScale)
+        out[base] = SIMD4(1, slot.radiusScale, highlight[min(max(slot.chirality, 0), 1)], Float(slot.chirality))
     }
 
     /// Joints (world, MediaPipe order) of the shown hand with `chirality` (0 left, 1 right), as

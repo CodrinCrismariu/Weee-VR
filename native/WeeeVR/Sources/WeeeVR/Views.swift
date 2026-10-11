@@ -24,6 +24,7 @@ struct RootView: View {
 struct CalibrationView: View {
     @EnvironmentObject private var model: AppModel
     @Environment(\.dismiss) private var dismiss
+    @State private var paddleHost = ""
 
     var body: some View {
         NavigationStack {
@@ -52,14 +53,49 @@ struct CalibrationView: View {
                     Toggle("Floating serve ball", isOn: $model.viewer.floatingServe)
                     SliderRow(title: "Opponent level", value: $model.viewer.opponentLevel, range: 0...1, format: "%.2f")
                     SliderRow(title: "Sound volume", value: $model.viewer.gameVolume, range: 0...1, format: "%.2f")
-                    SliderRow(title: "Hand prediction", value: $model.viewer.paddlePrediction, range: 0...0.12, format: "%.3f s")
+                    SliderRow(title: "Hand lead (ahead of camera image)", value: $model.viewer.paddlePrediction, range: 0...0.12, format: "%.3f s")
                     SliderRow(title: "Paddle grip angle", value: $model.viewer.gripAngleDeg, range: 0...80, format: "%.0f°")
                     SliderRow(title: "Paddle grip offset", value: $model.viewer.gripOffsetMM, range: -40...20, format: "%.0f mm")
-                    Toggle("Short exposure (sharper fast hands)", isOn: $model.viewer.shortExposure)
+                    SliderRow(title: "Camera max exposure (less blur)", value: $model.viewer.maxExposureMS, range: 2...17,
+                              format: model.viewer.maxExposureMS < 16.5 ? "%.0f ms" : "off")
                 } header: {
                     Text("Game")
                 } footer: {
                     Text("Tap places the table ahead of you. Pinch the ball (thumb + index) with your left hand to pick it up, open to toss; the paddle is in your right hand. Assist: a bigger hit zone, shots steered onto the table, a slower ball, a clean toss and friendlier returns (0% = realistic). Table height: standing ~0.8 m below the eyes, seated ~0.45 m.")
+                }
+                Section {
+                    Toggle("Smart paddle", isOn: $model.viewer.smartPaddle)
+                    LabeledContent("Board address") {
+                        TextField("10.243.94.25", text: $paddleHost)
+                            .multilineTextAlignment(.trailing)
+                            .keyboardType(.numbersAndPunctuation)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                            .onSubmit { model.viewer.paddleHost = paddleHost }
+                    }
+                    SliderRow(title: "Hit buzz", value: $model.viewer.paddleHaptics, range: 0...1, format: "%.0f%%", scale: 100)
+                    Button("Test buzz") { model.testPaddleBuzz() }
+                    Button("Record paddle data (20 s, for debugging)") { model.recordPaddle() }
+                    Button("Calibrate IMU (paddle lying still, once)") { model.calibratePaddleIMU() }
+                    Button(model.viewer.paddleCalibration == nil ? "Calibrate paddle (once)" : "Recalibrate paddle") {
+                        model.calibratePaddle()
+                    }
+                    if let cal = model.viewer.paddleCalibration {
+                        LabeledContent("Calibration", value: String(format: "fit %.1f° · clock %+.0f ms", cal.residualDeg,
+                                                                    cal.timeOffset * 1000))
+                        Button("Forget paddle calibration", role: .destructive) { model.forgetPaddleCalibration() }
+                    }
+                    Picker("Tag turned on the blade", selection: $model.viewer.paddleTagTurns) {
+                        Text("As calibrated").tag(-1)
+                        Text("0°").tag(0)
+                        Text("90°").tag(1)
+                        Text("180°").tag(2)
+                        Text("270°").tag(3)
+                    }
+                } header: {
+                    Text("Smart paddle")
+                } footer: {
+                    Text("\(model.paddleStatus)\n\nBoth are needed once and then saved. Calibrate IMU: lay the paddle down still for 2 s. Calibrate paddle: hold it in your right hand, tag toward the camera, and slowly turn it about different axes for ~5 s (it buzzes when it starts and twice when done). Without a connected, calibrated paddle the game uses your hand.")
                 }
                 Section {
                     Toggle("Accurate colour (BT.709 + P3)", isOn: $model.viewer.accurateColor)
@@ -99,13 +135,21 @@ struct CalibrationView: View {
                     Toggle("Flip camera 180°", isOn: $model.viewer.flipCamera)
                     Toggle("World grid", isOn: $model.viewer.showGrid)
                 }
-                Section("Cardboard lenses") {
+                Section {
+                    Picker("Headset", selection: Binding(get: { model.viewer.headset },
+                                                         set: { model.viewer.apply($0) })) {
+                        ForEach(Headset.allCases, id: \.self) { Text($0.label).tag($0) }
+                    }
                     SliderRow(title: "Distortion k1", value: $model.viewer.k1, range: -0.2...1.0, format: "%.3f")
                     SliderRow(title: "Distortion k2", value: $model.viewer.k2, range: -0.2...1.0, format: "%.3f")
                     SliderRow(title: "Lens separation", value: $model.viewer.interLensMM, range: 50...75, format: "%.1f mm")
                     SliderRow(title: "Screen to lens", value: $model.viewer.screenToLensMM, range: 25...55, format: "%.1f mm")
                     SliderRow(title: "Tray to lens centre", value: $model.viewer.trayToLensMM, range: 20...50, format: "%.1f mm")
                     SliderRow(title: "Lens field of view", value: $model.viewer.lensFovDeg, range: 30...70, format: "%.0f°")
+                } header: {
+                    Text("Headset lenses")
+                } footer: {
+                    Text("Choosing a headset loads its lens profile; the sliders fine-tune it. VRG Pro: set its IPD knob to your eye distance and Lens separation to the same value. If straight edges bend when you turn your head, adjust k1: edges bulging outward, lower it; pinched inward, raise it. Recenter in the headset: hold your open left palm toward your face for a second.")
                 }
                 Section("Phone + you") {
                     SliderRow(title: "Bottom bezel", value: $model.viewer.bottomBezelMM, range: 0...10, format: "%.1f mm")
@@ -113,9 +157,10 @@ struct CalibrationView: View {
                     SliderRow(title: "Your IPD", value: $model.viewer.ipdMM, range: 54...74, format: "%.1f mm")
                 }
                 Section {
-                    Button("Reset to Cardboard v2 defaults", role: .destructive) { model.viewer = ViewerProfile() }
+                    Button("Reset everything to defaults (VRG Pro)", role: .destructive) { model.viewer = ViewerProfile() }
                 }
             }
+            .onAppear { paddleHost = model.viewer.paddleHost }
             .navigationTitle("Calibration")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {

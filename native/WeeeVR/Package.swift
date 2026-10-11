@@ -3,7 +3,7 @@
 import Foundation
 import PackageDescription
 
-// Third-party C++ (XRSLAM, Ceres, Eigen, OpenCV) is assembled by scripts/fetch-xrslam.sh and mirrored
+// Third-party C/C++ (XRSLAM, Ceres, Eigen, OpenCV, AprilTag) is assembled by scripts/fetch-xrslam.sh and mirrored
 // into ThirdParty/ by scripts/dev.sh.
 let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().path
 let thirdParty = "\(root)/ThirdParty"
@@ -40,10 +40,12 @@ let package = Package(
             // Optimised even in xtool's Debug builds: the render thread and hand pipeline are hot.
             swiftSettings: [.swiftLanguageMode(.v5), .unsafeFlags(["-O"])]
         ),
-        // Our C interface to XRSLAM (include/XRSLAMCore.h) plus its os_log logging.
+        // Our C interface to XRSLAM (include/XRSLAMCore.h) plus its os_log logging, the hand-model
+        // crops and the paddle tag detector.
         .target(
             name: "XRSLAMCore",
-            dependencies: ["XRSLAM"],
+            dependencies: ["XRSLAM", "AprilTag"],
+            cSettings: [.unsafeFlags(["-O3", "-DNDEBUG", "-g0"])],
             cxxSettings: [.unsafeFlags(cxxFlags)],
             linkerSettings: [
                 .unsafeFlags(["-L\(thirdParty)/opencv/lib", "-lopencv2"]),
@@ -62,6 +64,14 @@ let package = Package(
             sources: ["src", "extra/src"],
             publicHeadersPath: "include",
             cxxSettings: [.unsafeFlags(cxxFlags)]
+        ),
+        // AprilRobotics apriltag (BSD-2), core + tagStandard41h12: the smart paddle's tag.
+        .target(
+            name: "AprilTag",
+            path: "ThirdParty/apriltag",
+            sources: ["src"],
+            publicHeadersPath: "include",
+            cSettings: [.unsafeFlags(["-O3", "-DNDEBUG", "-g0", "-w"])]
         ),
         // Ceres Solver 1.14 (BSD), used by XRSLAM's sliding-window bundle adjustment.
         .target(

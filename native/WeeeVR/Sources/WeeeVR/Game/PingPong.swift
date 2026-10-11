@@ -50,6 +50,8 @@ final class PingPong {
     var onSound: ((GameSound, SIMD3<Float>, Double) -> Void)?
     /// Rally events, for the log.
     var onEvent: ((String) -> Void)?
+    /// The player's paddle hit the ball (impact speed, m/s): the smart paddle buzzes.
+    var onPlayerHit: ((Double) -> Void)?
 
     private(set) var placed = false
     private(set) var origin = V3.zero        // table frame origin in the world
@@ -99,10 +101,27 @@ final class PingPong {
         return SIMD3<Float>(Float(w.x), Float(w.y), Float(w.z))
     }
 
+    /// A world direction in the table frame.
+    func toTable(direction d: V3) -> V3 {
+        let c = cos(yaw), s = sin(yaw)
+        return V3(c * d.x - s * d.z, d.y, s * d.x + c * d.z)
+    }
+
+    /// A world paddle pose (with its motion) in the table frame.
+    func toTable(_ p: PaddleState) -> PaddleState {
+        var t = PaddleState(center: toTable(direction: p.center - origin),
+                            basis: Basis(x: toTable(direction: p.basis.x), y: toTable(direction: p.basis.y),
+                                         z: toTable(direction: p.basis.z)))
+        t.velocity = toTable(direction: p.velocity)
+        t.angular = toTable(direction: p.angular)
+        t.visible = p.visible
+        return t
+    }
+
     // MARK: Frame update
 
-    /// Advance to `time` (the frame's display time) with the hands' joints there (world, MediaPipe
-    /// order; nil when not tracked).
+    /// Advance to `time` (the frame's display time) with the hands' joints (world, MediaPipe order, at
+    /// their true distance; nil when not tracked). The paddle is drawn where it is, at true distance.
     func update(time: Double, right: [SIMD3<Float>]?, left: [SIMD3<Float>]?) {
         guard placed else { return }
         var target = PaddleState()
@@ -115,11 +134,38 @@ final class PingPong {
         update(time: time, paddle: target, pinch: pinch)
     }
 
+    /// Advance to `time` with the smart paddle: `path(t)` is the measured paddle at real time `t`
+    /// (world, with its velocities), sampled at every physics substep, so a swing is followed along
+    /// its real curve. `left`: the left hand's joints, for the ball.
+    func update(time: Double, path: (Double) -> PaddleState, left: [SIMD3<Float>]?) {
+        guard placed else { return }
+        var pinch: (V3, V3)?
+        if let left, left.count >= 21 { pinch = (toTable(left[4]), toTable(left[8])) }
+        let start = realTime.map { max(time - min(max(time - $0, 0), 0.1), $0) } ?? time
+        let scale = timeScale
+        advance(time: time, pinch: pinch) { _, fraction, _ in
+            var p = self.toTable(path(start + (time - start) * fraction))
+            p.velocity /= scale                      // game time runs slower under the assist
+            p.angular /= scale
+            return p
+        }
+    }
+
     /// Game time runs this much slower than real time (assist).
     private var timeScale: Double { 1 - 0.35 * settings.assist }
 
     /// The same in the table frame (also the self-test's entry point).
     func update(time: Double, paddle target: PaddleState, pinch: (thumb: V3, index: V3)?) {
+        advance(time: time, pinch: pinch) { previous, fraction, span in
+            previous.visible && target.visible && span > 0
+                ? previous.interpolated(to: target, fraction: fraction, over: span) : target
+        }
+    }
+
+    /// Step the game to `time`; `pose(previous, fraction, span)` is the paddle `fraction` of the way
+    /// through this frame (`previous`: last frame's paddle; `span`: the frame's game time).
+    private func advance(time: Double, pinch: (thumb: V3, index: V3)?,
+                         pose paddleAt: (PaddleState, Double, Double) -> PaddleState) {
         let realElapsed = realTime.map { min(max(time - $0, 0), 0.1) } ?? 0     // a stall isn't simulated
         realTime = time
         let from = clock
@@ -133,18 +179,10 @@ final class PingPong {
         var t = max(simTime ?? clock, from - Physics.dt)
         while t + Physics.dt <= clock + 1e-9 {
             t += Physics.dt
-            var pose = target
-            if previous.visible, target.visible, span > 0 {
-                pose = previous.interpolated(to: target, fraction: clamped((t - from) / span, 0, 1), over: span)
-            }
-            step(at: t, paddle: pose)
+            step(at: t, paddle: paddleAt(previous, span > 0 ? clamped((t - from) / span, 0, 1) : 1, span))
         }
         simTime = t
-        if previous.visible, target.visible, span > 0 {
-            paddle = previous.interpolated(to: target, fraction: 1, over: span)
-        } else {
-            paddle = target
-        }
+        paddle = paddleAt(previous, 1, span)
         if case .over(let until) = phase, clock >= until { respawn() }
     }
 
@@ -243,6 +281,7 @@ final class PingPong {
         lastPaddleContact = t
         guard fresh else { return }
         sound(.paddle, speed)
+        onPlayerHit?(speed)
         steerShot()
         if phase == .inPlay {
             serve = lastHitter == .none
@@ -398,8 +437,10 @@ final class PingPong {
 
     // MARK: Renderer
 
-    /// The scene for the shader (`ShaderSource`, buffer 2), table frame; `sceneCount` float4s.
-    static let sceneCount = 12
+    /// The scene for the shader (`ShaderSource`, buffer 2), table frame; `sceneCount` float4s. The
+    /// last `overlayCount` are the smart paddle's tag overlay (world frame), filled by the engine.
+    static let sceneCount = 16
+    static let overlayBase = 12
     func sceneData() -> [SIMD4<Float>] {
         var out = [SIMD4<Float>](repeating: .zero, count: Self.sceneCount)
         guard placed else { return out }

@@ -10,6 +10,8 @@ final class AppModel: ObservableObject {
     }
     @Published var showCalibration = false
     @Published var calibrationResult: String?
+    @Published var paddleStatus = ""
+
     @Published var viewer = ViewerProfile.load() {
         didSet {
             viewer.save()
@@ -42,6 +44,12 @@ final class AppModel: ObservableObject {
 
     func start() {
         guard let engine, timer == nil else { return }
+        engine.onPaddleCalibrated = { [weak self] calibration in
+            MainActor.assumeIsolated { self?.viewer.paddleCalibration = calibration }
+        }
+        engine.onPaddleSmallTagsLearned = { [weak self] turns in
+            MainActor.assumeIsolated { self?.viewer.paddleSmallTagTurns = turns }
+        }
         engine.start()
         timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.refresh() }
@@ -81,6 +89,28 @@ final class AppModel: ObservableObject {
     func toggleReprojection() { viewer.reprojection.toggle() }
     func openCalibration() { showCalibration = true }
 
+    // MARK: Smart paddle
+
+    func testPaddleBuzz() { engine?.testPaddleBuzz() }
+    func calibratePaddleIMU() { engine?.calibratePaddleIMU() }
+
+    /// Closes the settings; the paddle buzzes at the start and twice when the 20 s are saved.
+    func recordPaddle() {
+        showCalibration = false
+        engine?.recordPaddle()
+    }
+
+    /// Closes the settings so the camera sees the paddle; it buzzes at the start and twice when done.
+    func calibratePaddle() {
+        showCalibration = false
+        engine?.calibratePaddle()
+    }
+
+    func forgetPaddleCalibration() {
+        viewer.paddleCalibration = nil
+        viewer.paddleSmallTags = []
+    }
+
     /// Camera-IMU calibration dataset (scripts/calib): ultra-wide gyro mode while recording, then
     /// back to the previous mode.
     func recordCalibration() {
@@ -108,6 +138,7 @@ final class AppModel: ObservableObject {
         let thermal = Self.describe(ProcessInfo.processInfo.thermalState)
         let p = status.position
         let memory = Self.memoryFootprintMB()
+        if paddleStatus != status.paddleMessage { paddleStatus = status.paddleMessage }
 
         if showHUD {
             var lines = [
@@ -126,6 +157,7 @@ final class AppModel: ObservableObject {
             if let slamInfo = status.slamInfo { lines.append(slamInfo) }
             if let handsInfo = status.handsInfo { lines.append(handsInfo) }
             if let gameInfo = status.gameInfo { lines.append(gameInfo) }
+            if let paddleInfo = status.paddleInfo { lines.append(paddleInfo) }
             if let recording = engine.calibrationStatus {
                 lines = [recording] + lines
             } else if let calibrationResult {
@@ -137,10 +169,10 @@ final class AppModel: ObservableObject {
 
         if now - lastLog >= 2 {
             lastLog = now
-            Log.info(String(format: "stats mode=%@ fov=%.0fx%.0f source=%@ tracking=%@ pos=%.2f,%.2f,%.2f depth=%.2f reproj=%ld latch=%ld hud=%ld slam=[%@] hands=[%@] game=[%@] p50=%.1f p95=%.1f max=%.1f arrival=%.1f fps=%.1f cam=%.1f missed=%ld cpu95=%.2f gpu95=%.2f budget=%.1f unshown=%llu thermal=%@ mem=%.0fMB n=%ld",
+            Log.info(String(format: "stats mode=%@ fov=%.0fx%.0f source=%@ tracking=%@ pos=%.2f,%.2f,%.2f depth=%.2f reproj=%ld latch=%ld hud=%ld slam=[%@] hands=[%@] game=[%@] paddle=[%@] p50=%.1f p95=%.1f max=%.1f arrival=%.1f fps=%.1f cam=%.1f missed=%ld cpu95=%.2f gpu95=%.2f budget=%.1f unshown=%llu thermal=%@ mem=%.0fMB n=%ld",
                   viewer.passthrough.label, status.cameraFovDeg.x, status.cameraFovDeg.y, status.source, status.tracking ?? "-", p.x, p.y, p.z, status.depth,
                   viewer.reprojection ? 1 : 0, viewer.lateLatch ? 1 : 0, showHUD ? 1 : 0, status.slamInfo ?? "-", status.handsInfo ?? "-", status.gameInfo ?? "-",
-                  s.photonP50, s.photonP95, s.photonMax, s.arrivalP50, s.displayFps, cameraFps,
+                  status.paddleInfo ?? "-", s.photonP50, s.photonP95, s.photonMax, s.arrivalP50, s.displayFps, cameraFps,
                   s.missedRefreshes, s.renderCpuP95, s.gpuP95, status.renderBudgetMS,
                   counters.neverShown, thermal, memory, s.samples))
         }
