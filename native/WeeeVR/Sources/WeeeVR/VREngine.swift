@@ -73,6 +73,9 @@ final class VREngine: NSObject, CAMetalDisplayLinkDelegate {
     var onPaddleCalibrated: ((PaddleCalibration) -> Void)?
     /// The small tags' placements were learned (save them in the profile).
     var onPaddleSmallTagsLearned: (([Int: Int]) -> Void)?
+    /// The game recording started (true) or ended (false: the video's file, nil if nothing was recorded,
+    /// and whether it is in Photos).
+    var onGameRecording: ((Bool, URL?, Bool) -> Void)?
 
     private let lock = NSLock()
     private var viewer: ViewerProfile
@@ -101,14 +104,25 @@ final class VREngine: NSObject, CAMetalDisplayLinkDelegate {
     private var lastGameSummary: String?
     private var handResetPending = false
     private var paddleCalibrationPending = false
-    private var paddleRecordPending = false
+    private var appliedPaddleCalibration: PaddleCalibration?
+    private var appliedSmallTurns: [Int: Int]?
+    private var paddleRecordPending: Double?                 // seconds asked for
+    private var paddleRecordStop = false
     private var paddleRecording: (lines: [String], until: Double)?   // render thread: raw paddle data
     private var lastTagSequence: UInt64 = 0
     private var lastHandSequence: UInt64 = 0
     private var lastPaddleSummary: String?
     private var hitBuzz: Float = 0.8                 // render thread: buzz strength for `onPlayerHit`
+    private var table = TableAnchor()                 // render thread: the table on its tag (67)
+    private var playDepth: Float?                     // render thread: the sphere's radius while playing
     private var tagOutline: (corners: [SIMD3<Float>], time: Double)?   // render thread: on the passthrough sphere
     private var tagFlash: (success: Bool, until: Double)?              // render thread: calibration result
+    private var gameRecordPending = false            // under `lock`
+    private var gameRecordStop = false               // under `lock`
+    private var gameRecorder: GameRecorder?          // render thread
+    private var gameRecordStarted = 0.0              // render thread
+    private var gameRecordEnds: Double?              // render thread: a few seconds after the game's last point
+    private var scoreKey = ""                        // render thread: the scoreboard as drawn
     private var workEstimate = 0.002                 // peak-decayed CPU + GPU seconds per frame
     private var missPenalty = 0.0
 
@@ -141,6 +155,9 @@ final class VREngine: NSObject, CAMetalDisplayLinkDelegate {
             }
             DispatchQueue.main.async { self.onPaddleCalibrated?(calibration) }
         }
+        paddleFusion.onCalibrationImproved = { [weak self] calibration in
+            DispatchQueue.main.async { self?.onPaddleCalibrated?(calibration) }
+        }
         paddleFusion.onCalibrationFailed = { [weak self] _ in
             guard let self else { return }
             tagFlash = (false, CACurrentMediaTime() + 1.5)
@@ -154,7 +171,7 @@ final class VREngine: NSObject, CAMetalDisplayLinkDelegate {
         }
         paddleLink.onMessage = { Log.info("paddle link: \($0)") }
         paddleLink.connect(to: viewer.smartPaddle ? viewer.paddleHost : nil)
-        tags.enabled = viewer.smartPaddle && viewer.scene == .pingPong
+        tags.enabled = (viewer.smartPaddle || viewer.tableTag) && viewer.scene == .pingPong
         tags.flipped = viewer.flipCamera
         gameAudio.volume = viewer.gameVolume
         DispatchQueue.global(qos: .utility).async {
@@ -276,7 +293,7 @@ final class VREngine: NSObject, CAMetalDisplayLinkDelegate {
         if newLens != lens { presetIndex = 0 }
         hands.enabled = viewer.handTracking
         hands.flipped = viewer.flipCamera
-        tags.enabled = viewer.smartPaddle && viewer.scene == .pingPong
+        tags.enabled = (viewer.smartPaddle || viewer.tableTag) && viewer.scene == .pingPong
         tags.flipped = viewer.flipCamera
         mode = newMode
         lens = newLens
@@ -315,30 +332,63 @@ final class VREngine: NSObject, CAMetalDisplayLinkDelegate {
         paddleLink.buzz(strength: 0.6, milliseconds: 80)
     }
 
-    /// 20 s of the paddle's raw inputs (IMU, tag poses in the camera, camera poses, palm) to
-    /// Documents/paddle-rec/, for replaying the fusion offline.
-    func recordPaddle() {
+    /// `seconds` of the paddle's raw inputs (IMU, tag poses in the camera, camera poses, palm) and the
+    /// paddle as shown, to Documents/paddle-rec/, for replaying the fusion offline.
+    func recordPaddle(seconds: Double) {
         lock.lock()
-        paddleRecordPending = true
+        paddleRecordPending = seconds
         lock.unlock()
         paddleLink.buzz(strength: 0.6, milliseconds: 80)
+    }
+
+    /// Ends a paddle recording now and saves what it has.
+    func stopPaddleRecording() {
+        lock.lock()
+        paddleRecordStop = true
+        lock.unlock()
+    }
+
+    /// Records the next game, to 11, as a flat video (the sphere's picture from between the eyes, and the
+    /// game's sounds): the score starts again at 0-0. It ends a few seconds after the last point.
+    func recordGame() {
+        lock.lock()
+        gameRecordPending = true
+        lock.unlock()
+    }
+
+    func stopGameRecording() {
+        lock.lock()
+        gameRecordStop = true
+        lock.unlock()
     }
 
     /// One-time gyro bias measurement on the board (the paddle lying still for ~2 s).
     func calibratePaddleIMU() { paddleLink.calibrateIMU() }
 
+    /// A medium hit at the current vibration strength.
     func testPaddleBuzz() {
         lock.lock()
         let strength = viewer.paddleHaptics
         lock.unlock()
-        paddleLink.buzz(strength: Double(max(strength, 0.3)), milliseconds: 150)
+        let (pwm, ms) = Self.hitBuzz(speed: 4, strength: strength)
+        paddleLink.buzz(strength: pwm, milliseconds: ms)
+    }
+
+    /// The buzz for a hit at `speed` (m/s) with the vibration slider at `strength` (0...1): a soft touch
+    /// short and light, a smash long and full power. Vibration motors don't turn below about a quarter
+    /// power and need ~30 ms to spin up, so any buzz starts above that.
+    static func hitBuzz(speed: Double, strength: Float) -> (pwm: Double, ms: Int) {
+        guard strength > 0 else { return (0, 0) }
+        let k = min(max(speed, 0) / 7, 1)
+        let feel = Double(strength) * (0.35 + 0.65 * k)
+        return (0.25 + 0.75 * feel, Int(80 + 60 * k))
     }
 
     /// Render thread (inside the game step): a player hit, felt in proportion to its speed.
     private func buzzForHit(speed: Double) {
         guard hitBuzz > 0 else { return }
-        let k = min(speed / 8, 1)
-        paddleLink.buzz(strength: Double(hitBuzz) * max(k, 0.35), milliseconds: Int(40 + 30 * k))
+        let (pwm, ms) = Self.hitBuzz(speed: speed, strength: hitBuzz)
+        paddleLink.buzz(strength: pwm, milliseconds: ms)
     }
 
     /// The calibration ring around the big tag (only while calibrating or just after), world frame:
@@ -368,28 +418,74 @@ final class VREngine: NSObject, CAMetalDisplayLinkDelegate {
         return (r.float, .zero)
     }
 
-    /// Render thread: new IMU samples, tag sightings and right-palm positions into the fusion.
-    private func feedPaddle(_ vp: ViewerProfile, handDetection: HandTracker.Detection?, time: Double, proxyDepth: Float) {
-        if paddleFusion.calibration != vp.paddleCalibration { paddleFusion.calibration = vp.paddleCalibration }
-        if paddleFusion.smallTurns != vp.paddleSmallTagTurns { paddleFusion.smallTurns = vp.paddleSmallTagTurns }
+    /// Render thread: a sighting of the table's tag (67) into the anchor (`TableAnchor`).
+    private func anchorTable(_ detection: TagTracker.Detection, head: SIMD3<Float>) {
+        guard let tag = detection.tags.first(where: { $0.id == TagTracker.tableTagID }),
+              let (rotation, position) = detectionPose(detection.pose, captureTime: detection.captureTime) else { return }
+        let r = simd_double3x3(columns: (SIMD3<Double>(rotation.columns.0), SIMD3<Double>(rotation.columns.1),
+                                          SIMD3<Double>(rotation.columns.2)))
+        let p = SIMD3<Double>(position)
+        let candidates = tag.solutions.map { s -> (rotation: Quat, position: V3) in
+            let world = r * s.rotation, centre = p + r * s.translation
+            return (Quat(basis: Basis(x: V3(world.columns.0.x, world.columns.0.y, world.columns.0.z),
+                                      y: V3(world.columns.1.x, world.columns.1.y, world.columns.1.z),
+                                      z: V3(world.columns.2.x, world.columns.2.y, world.columns.2.z))),
+                    V3(centre.x, centre.y, centre.z))
+        }
+        let before = table.anchor
+        table.add(candidates: candidates, camera: V3(p.x, p.y, p.z),
+                  head: V3(Double(head.x), Double(head.y), Double(head.z)), time: detection.captureTime)
+        if let a = table.anchor, before == nil || vlength(a.centre - before!.centre) > 0.1 {
+            Log.info(String(format: "table: on tag 67 at %.2f %.2f %.2f, heading %.0f°", a.centre.x, a.centre.y, a.centre.z,
+                            a.yaw * 180 / .pi))
+        }
+    }
+
+    /// Render thread: the table where the anchor shows it (the middle of the player's half on the tag;
+    /// the table's centre half a half-length beyond, away from the player).
+    private func applyTable(time: Double) {
+        guard let s = table.shown(at: time) else { return }
+        let d = Table.halfLength / 2
+        game.anchor(centre: V3(s.centre.x - sin(s.yaw) * d, s.centre.y, s.centre.z - cos(s.yaw) * d), yaw: s.yaw)
+    }
+
+    private func feedPaddle(_ vp: ViewerProfile, handDetection: HandTracker.Detection?, tagDetection: TagTracker.Detection?,
+                            time: Double, proxyDepth: Float) {
+        // Only when the saved values change (loaded, reset, or saved after the fusion learned them): the
+        // fusion's own newer values must not be overwritten while their save is on its way.
+        if vp.paddleCalibration != appliedPaddleCalibration {
+            appliedPaddleCalibration = vp.paddleCalibration
+            if paddleFusion.calibration != vp.paddleCalibration { paddleFusion.calibration = vp.paddleCalibration }
+        }
+        if vp.paddleSmallTagTurns != appliedSmallTurns {
+            appliedSmallTurns = vp.paddleSmallTagTurns
+            if paddleFusion.smallTurns != vp.paddleSmallTagTurns { paddleFusion.smallTurns = vp.paddleSmallTagTurns }
+        }
         paddleFusion.tagTurnsOverride = vp.paddleTagTurns >= 0 ? vp.paddleTagTurns : nil
         if paddleCalibrationPending {
             paddleCalibrationPending = false
             paddleFusion.beginCalibration()
         }
         paddleFusion.tick(time: time)
-        if paddleRecordPending {
-            paddleRecordPending = false
+        if let seconds = paddleRecordPending {
+            paddleRecordPending = nil
             let c = vp.paddleCalibration
             paddleRecording = (["C," + (c.map { "\($0.mount.map { String($0) }.joined(separator: ",")),\($0.timeOffset),\($0.tagTurns)" } ?? "none")],
-                               time + 20)
+                               time + seconds)
+            paddleRecording!.lines.reserveCapacity(Int(seconds * 300))
+        }
+        if paddleRecordStop {
+            paddleRecordStop = false
+            paddleRecording?.until = 0
         }
         let samples = paddleLink.take()
         if paddleRecording != nil {
             for s in samples {
-                paddleRecording!.lines.append(String(format: "I,%.6f,%.6f,%.6f,%.6f,%.6f,%.5f,%.5f,%.5f,%d", s.time,
-                                                     s.orientation[0], s.orientation[1], s.orientation[2], s.orientation[3],
-                                                     s.rate.x, s.rate.y, s.rate.z, s.still ? 1 : 0))
+                var line = String(format: "I,%.6f,%.6f,%.6f,%.6f,%.6f,%.5f,%.5f,%.5f,%d", s.time,
+                                  s.orientation[0], s.orientation[1], s.orientation[2], s.orientation[3],
+                                  s.rate.x, s.rate.y, s.rate.z, s.still ? 1 : 0)
+                if let a = s.accel { line += String(format: ",%.5f,%.5f,%.5f", a.x, a.y, a.z) }
+                paddleRecording!.lines.append(line)
             }
         }
         if !samples.isEmpty {
@@ -397,11 +493,11 @@ final class VREngine: NSObject, CAMetalDisplayLinkDelegate {
                 PaddleIMUSample(time: $0.time,
                                 orientation: Quat(w: $0.orientation[0], x: $0.orientation[1], y: $0.orientation[2],
                                                   z: $0.orientation[3]),
-                                rate: V3($0.rate.x, $0.rate.y, $0.rate.z), still: $0.still)
+                                rate: V3($0.rate.x, $0.rate.y, $0.rate.z), still: $0.still,
+                                accel: $0.accel.map { V3($0.x, $0.y, $0.z) })
             })
         }
-        if let detection = tags.latestDetection(), detection.sequence != lastTagSequence {
-            lastTagSequence = detection.sequence
+        if let detection = tagDetection {
             if let (rotation, position) = detectionPose(detection.pose, captureTime: detection.captureTime) {
                 let r = simd_double3x3(columns: (SIMD3<Double>(rotation.columns.0), SIMD3<Double>(rotation.columns.1),
                                                   SIMD3<Double>(rotation.columns.2)))
@@ -422,6 +518,7 @@ final class VREngine: NSObject, CAMetalDisplayLinkDelegate {
                         }
                         paddleRecording!.lines.append(line)
                     }
+                    guard tag.id != TagTracker.tableTagID else { continue }      // the table's (recorded only)
                     let candidates = tag.solutions.map { s -> PaddleTagSighting.Candidate in
                         let world = r * s.rotation
                         let centre = p + r * s.translation
@@ -455,10 +552,12 @@ final class VREngine: NSObject, CAMetalDisplayLinkDelegate {
             lastHandSequence = handDetection.sequence
             if let j = gameHands.joints(chirality: 1), j.count >= 21 {
                 let palm = (j[0] + j[5] + j[9] + j[13] + j[17]) / 5
-                paddleRecording?.lines.append(String(format: "P,%.6f,%.5f,%.5f,%.5f", handDetection.captureTime,
-                                                     palm.x, palm.y, palm.z))
-                paddleFusion.addPalm(V3(Double(palm.x), Double(palm.y), Double(palm.z)),
-                                     time: handDetection.captureTime)
+                let camera = detectionPose(handDetection.pose, captureTime: handDetection.captureTime)?.1
+                var line = String(format: "P,%.6f,%.5f,%.5f,%.5f", handDetection.captureTime, palm.x, palm.y, palm.z)
+                if let camera { line += String(format: ",%.5f,%.5f,%.5f", camera.x, camera.y, camera.z) }
+                paddleRecording?.lines.append(line)
+                paddleFusion.addPalm(V3(Double(palm.x), Double(palm.y), Double(palm.z)), time: handDetection.captureTime,
+                                     camera: camera.map { V3(Double($0.x), Double($0.y), Double($0.z)) })
             }
         }
         finishPaddleRecording(time: time)
@@ -604,10 +703,96 @@ final class VREngine: NSObject, CAMetalDisplayLinkDelegate {
             self?.stats.addGpuTime(seconds: gpuSeconds)
         })
 
+        // The game recording: the same moment as a flat view, into a video frame (30 per second).
+        if let recorder = gameRecorder, let frame, let video = recorder.nextFrame(at: update.targetPresentationTimestamp) {
+            renderer.drawRecording(into: video.texture, frame: frame, uniforms: Self.recordingUniforms(uniforms, frame: frame),
+                                   hands: handData, scene: sceneData, completed: video.commit)
+        }
+
         let cpu = CACurrentMediaTime() - start
         stats.addRenderCost(cpuSeconds: cpu)
         let gpu = stats.snapshotGpuEstimate
         workEstimate = max(cpu + gpu, workEstimate * 0.98)
+    }
+
+    // MARK: Game recording and scoreboard
+
+    /// Render thread (under `lock`): starts the game recording once a game is on, ends it after the game.
+    private func updateGameRecording(now: Double, playing: Bool) {
+        if gameRecordPending, playing {
+            gameRecordPending = false
+            if gameRecorder == nil {
+                let done = onGameRecording
+                do {
+                    let recorder = try GameRecorder(device: renderer.device, audioFormat: gameAudio.outputFormat)
+                    gameRecorder = recorder
+                    gameRecordStarted = now
+                    gameRecordEnds = nil
+                    game.newGame()
+                    gameAudio.setTap { [weak recorder] buffer, time in recorder?.addAudio(buffer, at: time) }
+                    Log.info("game recording: started, \(recorder.url.lastPathComponent)")
+                    DispatchQueue.main.async { done?(true, nil, false) }
+                } catch {
+                    Log.info("game recording: could not start: \(error.localizedDescription)")
+                    DispatchQueue.main.async { done?(false, nil, false) }
+                }
+            }
+        }
+        guard let recorder = gameRecorder else {
+            gameRecordStop = false
+            return
+        }
+        if game.winner != nil, gameRecordEnds == nil { gameRecordEnds = now + 4 }    // the winning point, then 4 s
+        let over = gameRecordEnds.map { now > $0 } ?? false
+        guard gameRecordStop || over || now - gameRecordStarted > 30 * 60 else { return }
+        gameRecordStop = false
+        gameRecorder = nil
+        gameAudio.setTap(nil)
+        let done = onGameRecording
+        recorder.finish { url, inPhotos in
+            Log.info("game recording: " + (url.map { "saved \($0.lastPathComponent)" } ?? "nothing recorded")
+                     + (inPhotos ? ", in Photos" : ""))
+            DispatchQueue.main.async { done?(false, url, inPhotos) }
+        }
+    }
+
+    /// Render thread: redraws the scoreboard's texture when what it shows changes.
+    private func updateScoreboard() {
+        let you = game.playerScore, ai = game.opponentScore
+        let message: String
+        if let winner = game.winner {
+            message = winner == .player ? "YOU WIN!" : "AI WINS"
+        } else if you >= PingPong.gamePoints - 1, you == ai {
+            message = "DEUCE"
+        } else if max(you, ai) >= PingPong.gamePoints - 1, you != ai {
+            message = "GAME POINT"
+        } else {
+            message = ""
+        }
+        let recording = gameRecorder != nil
+        let key = "\(you) \(ai) \(message) \(recording)"
+        guard key != scoreKey else { return }
+        scoreKey = key
+        DispatchQueue.global(qos: .userInitiated).async { [renderer] in
+            renderer.setScore(ScoreRasterizer.makeTexture(player: you, opponent: ai, message: message, recording: recording,
+                                                          device: renderer.device))
+        }
+    }
+
+    /// The headset frame's uniforms as a flat 16:9 view from between the eyes: a little inside the
+    /// camera's field of view, no lenses, no HUD, plain BT.709 colour.
+    private static func recordingUniforms(_ base: Uniforms, frame: CameraFrame) -> Uniforms {
+        var u = base
+        let tanCamera = SIMD2<Float>(frame.size.x / 2 / frame.intrinsics.x, frame.size.y / 2 / frame.intrinsics.y) * 0.85
+        var tan = SIMD2<Float>(tanCamera.x, tanCamera.x * 9 / 16)
+        if tan.y > tanCamera.y { tan = SIMD2(tanCamera.y * 16 / 9, tanCamera.y) }
+        u.screen = SIMD4(Float(GameRecorder.width), Float(GameRecorder.height), u.screen.z, u.screen.w)
+        u.optics.z = 1
+        u.optics.w = Float(Int(u.optics.w) & ~4)
+        u.image.z = 0
+        u.chroma = .zero
+        u.recording = SIMD4(1, tan.x, tan.y, 0)
+        return u
     }
 
     // MARK: Per-frame maths
@@ -683,11 +868,33 @@ final class VREngine: NSObject, CAMetalDisplayLinkDelegate {
         // Eye midpoint: offset from the passthrough camera, rotated with the head.
         let viewRotation = worldFromView.float
         let head = viewPosition + viewRotation * (vp.eyeOffset - lensOffset)
-        let proxyDepth = vp.autoDepth ? (frame.proxyDepth ?? vp.fixedDepthM) : vp.fixedDepthM
+        var proxyDepth = vp.autoDepth ? (frame.proxyDepth ?? vp.fixedDepthM) : vp.fixedDepthM
 
         // Recenter: place the cube 1 m ahead / the table in front once there is a valid pose (ARKit,
         // XRSLAM: once tracking is normal).
         let playing = vp.scene == .pingPong
+        // While playing, the passthrough sphere sits at the middle of the player's half of the table:
+        // that area (and everything drawn there) gets the right depth, and the picture doesn't breathe
+        // with the tracker's changing median depth.
+        if playing, game.placed {
+            let near = game.toWorld(V3(0, 0, Table.halfLength / 2))
+            let target = min(max(simd_distance(head, near), 0.6), 3)
+            let previous = playDepth ?? target
+            playDepth = previous + (target - previous) * (1 - exp(-frameDt / 1.0))
+            proxyDepth = playDepth!
+        } else {
+            playDepth = nil
+        }
+        // The settings before any placing below (place() reads the table drop).
+        if playing {
+            PaddleShape.semiWidth = Double(vp.paddleBladeWidthMM) / 2000
+            PaddleShape.semiLength = Double(vp.paddleBladeLengthMM) / 2000
+            PaddleShape.handleLength = Double(vp.paddleHandleMM) / 1000
+            game.settings = GameSettings(tableDrop: Double(vp.tableDropM), opponentLevel: Double(vp.opponentLevel),
+                                         gripAngle: Double(vp.gripAngleDeg) * .pi / 180,
+                                         gripOffset: Double(vp.gripOffsetMM) / 1000,
+                                         assist: Double(vp.assist), floatingServe: vp.floatingServe)
+        }
         if recenterPending {
             if frame.pose == nil, qDisplay != nil {
                 let unrecentered = Frames.rotationY(yawOffset) * worldFromView
@@ -713,6 +920,7 @@ final class VREngine: NSObject, CAMetalDisplayLinkDelegate {
             handResetPending = false
             handModel.reset()
             gameHands.reset()
+            table.reset()
         }
         handModel.lostHold = playing ? 0.3 : 0.12
         gameHands.lostHold = handModel.lostHold
@@ -756,13 +964,23 @@ final class VREngine: NSObject, CAMetalDisplayLinkDelegate {
         // The game, stepped to the display time with the hands at their true distance; the paddle is
         // drawn where it is (true distance), the hands where the camera shows them (the sphere).
         var sceneFlags: Float = 0
+        // The tags seen since the last frame: the table's places the table, the paddle's go to the fusion.
+        var newTags: TagTracker.Detection?
+        if let detection = tags.latestDetection(), detection.sequence != lastTagSequence {
+            lastTagSequence = detection.sequence
+            newTags = detection
+        }
+        if playing, vp.tableTag {
+            if let newTags { anchorTable(newTags, head: head) }
+            applyTable(time: CACurrentMediaTime())
+        }
         if playing, game.placed {
-            game.settings = GameSettings(tableDrop: Double(vp.tableDropM), opponentLevel: Double(vp.opponentLevel),
-                                         gripAngle: Double(vp.gripAngleDeg) * .pi / 180,
-                                         gripOffset: Double(vp.gripOffsetMM) / 1000,
-                                         assist: Double(vp.assist), floatingServe: vp.floatingServe)
             let left = vp.handTracking ? gameHands.joints(chirality: 0) : nil
-            if vp.smartPaddle { feedPaddle(vp, handDetection: handDetection, time: frame.captureTime, proxyDepth: proxyDepth) }
+            if vp.smartPaddle {
+                paddleFusion.head = V3(Double(head.x), Double(head.y), Double(head.z))
+                feedPaddle(vp, handDetection: handDetection, tagDetection: newTags, time: frame.captureTime,
+                           proxyDepth: proxyDepth)
+            }
             if vp.smartPaddle, paddleFusion.pose(at: displayTarget) != nil {
                 // The smart paddle, sampled along its measured path at every physics substep.
                 game.update(time: displayTarget, path: { [paddleFusion] t in paddleFusion.pose(at: t) ?? PaddleState() },
@@ -781,14 +999,39 @@ final class VREngine: NSObject, CAMetalDisplayLinkDelegate {
                 }
             }
             sceneData = game.sceneData()
+            // Drawn at this camera image's moment, so it sits on the real paddle in the image (the
+            // physics and the hits keep the display-time paddle).
+            if vp.smartPaddle, vp.paddleOnCameraImage, let p = paddleFusion.drawnPose(at: frame.captureTime) {
+                let t = game.toTable(p)
+                func f3(_ v: V3) -> SIMD3<Float> { SIMD3<Float>(Float(v.x), Float(v.y), Float(v.z)) }
+                sceneData[4] = SIMD4(f3(t.center), 1)
+                sceneData[5] = SIMD4(f3(t.basis.x), Float(PaddleShape.semiWidth))
+                sceneData[6] = SIMD4(f3(t.basis.y), Float(PaddleShape.semiLength))
+                sceneData[7] = SIMD4(f3(t.basis.z), Float(PaddleShape.handleLength))
+            }
+            // The paddle as shown (when it's drawn, its centre and rotation, and the head), for comparing a
+            // replay with what was seen.
+            if vp.smartPaddle, paddleRecording != nil {
+                let at = vp.paddleOnCameraImage ? frame.captureTime : displayTarget
+                if let p = vp.paddleOnCameraImage ? paddleFusion.drawnPose(at: at) : paddleFusion.pose(at: at) {
+                    let q = Quat(basis: p.basis)
+                    paddleRecording!.lines.append(String(format: "S,%.6f,%.5f,%.5f,%.5f,%.6f,%.6f,%.6f,%.6f,%.5f,%.5f,%.5f",
+                                                         at, p.center.x, p.center.y, p.center.z, q.w, q.x, q.y, q.z,
+                                                         head.x, head.y, head.z))
+                }
+            }
             if vp.smartPaddle { writeTagOverlay(into: &sceneData, time: frame.captureTime) }
             sceneFlags = 16
             gameAudio.setListener(position: head, forward: viewRotation * SIMD3<Float>(0, 0, -1),
                                   up: viewRotation * SIMD3<Float>(0, 1, 0))
+            updateScoreboard()
             lastGameSummary = game.summary
+                + (vp.tableTag && table.anchor != nil ? " · table on tag 67" : vp.tableTag ? " · tag 67 not seen" : "")
+                + (gameRecorder != nil ? " · REC" : "")
         } else {
             lastGameSummary = nil
         }
+        updateGameRecording(now: CACurrentMediaTime(), playing: playing && game.placed)
         lastPosition = viewPosition
         lastDepth = proxyDepth
         lastIntrinsics = frame.intrinsics

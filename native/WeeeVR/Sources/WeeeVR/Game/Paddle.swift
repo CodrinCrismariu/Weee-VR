@@ -3,10 +3,12 @@ import Foundation
 /// Paddle geometry (the shader mirrors it). Paddle frame: origin at the blade centre, y along the
 /// blade from the handle to the tip, z the forehand (red) face's normal, x = y × z.
 enum PaddleShape {
-    static let semiWidth = 0.075            // blade 150 x 158 mm
-    static let semiLength = 0.079
+    // The player's paddle (Settings > Smart paddle: blade width / length, handle); 150 x 158 mm and a
+    // 10 cm handle by default, a standard blade.
+    static var semiWidth = 0.075
+    static var semiLength = 0.079
     static let halfThickness = 0.006        // blade + rubbers
-    static let handleLength = 0.10
+    static var handleLength = 0.10
     static let handleHalfWidth = 0.0125
     static let handleHalfThickness = 0.011
     /// Blade centre from the middle of the handle (where the palm holds it).

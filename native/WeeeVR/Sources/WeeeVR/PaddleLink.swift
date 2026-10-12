@@ -7,7 +7,8 @@ import QuartzCore
 /// stream, and haptic buzzes and calibration requests back.
 ///
 /// The phone connects to the board's TCP port 7700 and says hello with the UDP port it listens on
-/// and its own address; the board then sends each 200 Hz sample as one UDP datagram (28 bytes).
+/// and its own address; the board then sends each 200 Hz sample as one UDP datagram (32 bytes: time,
+/// orientation, gyro, accelerometer; 28 from older firmware, without the accelerometer).
 /// A ping every 0.25 s keeps the board streaming (it stops after 3 s of silence) and measures the
 /// round trip.
 ///
@@ -24,7 +25,7 @@ final class PaddleLink {
         var rate: SIMD3<Double>     // rad/s, IMU frame
         var still: Bool
         var calibrated: Bool        // the board has a gyro bias
-        var accelNorm: Double       // g
+        var accel: SIMD3<Double>?   // g, IMU frame, averaged since the previous sample (nil: old firmware)
     }
 
     struct Stats {
@@ -306,19 +307,23 @@ final class PaddleLink {
                 return
             }
             let arrival = CACurrentMediaTime()
-            guard n == 28, buffer[0] == 0x57, buffer[1] == 0x50, buffer[2] == 0x49, buffer[3] == 0x31 else { continue }
+            guard buffer[0] == 0x57, buffer[1] == 0x50, buffer[2] == 0x49 else { continue }
+            let v2 = n == 32 && buffer[3] == 0x32           // "WPI2": with the accelerometer
+            guard v2 || (n == 28 && buffer[3] == 0x31) else { continue }
             func word(_ i: Int) -> UInt32 {
                 UInt32(buffer[4 + 4 * i]) | UInt32(buffer[5 + 4 * i]) << 8 | UInt32(buffer[6 + 4 * i]) << 16
                     | UInt32(buffer[7 + 4 * i]) << 24
             }
             func s16(_ v: UInt32) -> Double { Double(Int16(bitPattern: UInt16(truncatingIfNeeded: v))) }
-            let seq = word(0), t = word(1), q01 = word(2), q23 = word(3), w01 = word(4), w2f = word(5)
+            let seq = word(0), t = word(1), q01 = word(2), q23 = word(3), w01 = word(4), w5 = word(5)
             let q = SIMD4(s16(q01), s16(q01 >> 16), s16(q23), s16(q23 >> 16)) / 32767
-            let rate = SIMD3(s16(w01), s16(w01 >> 16), s16(w2f)) / 16 * .pi / 180
-            let flags = (w2f >> 16) & 0xFF
-            ingest(seq: seq, mcu: t, arrival: arrival, sample: Sample(
+            let rate = SIMD3(s16(w01), s16(w01 >> 16), s16(w5)) / 16 * .pi / 180
+            // v2: flags in the time's 2 low bits, the accelerometer in 1/2048 g; v1: flags in w5's 3rd byte.
+            let flags = v2 ? t & 3 : (w5 >> 16) & 0xFF
+            let accel = v2 ? SIMD3(s16(w5 >> 16), s16(word(6)), s16(word(6) >> 16)) / 2048 : nil
+            ingest(seq: seq, mcu: v2 ? t & ~3 : t, arrival: arrival, sample: Sample(
                 time: 0, orientation: q / max((q * q).sum().squareRoot(), 1e-9), rate: rate,
-                still: flags & 1 != 0, calibrated: flags & 2 != 0, accelNorm: Double(w2f >> 24) / 16))
+                still: flags & 1 != 0, calibrated: flags & 2 != 0, accel: accel))
         }
     }
 

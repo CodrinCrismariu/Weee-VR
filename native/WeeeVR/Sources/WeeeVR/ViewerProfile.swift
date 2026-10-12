@@ -47,7 +47,7 @@ struct ViewerProfile: Codable, Equatable {
     var slamKeypoints: Float = 300
     var slamWindow: Float = 10          // sliding-window keyframes (XRSLAM's benchmark setting; its iOS app used 5)
     var slamDefaultsVersion = 2         // bump to reset saved slam* values to new defaults
-    var defaultsVersion = 7             // bump (and list keys in `resetOnUpgrade`) to push new defaults
+    var defaultsVersion = 9             // bump (and list keys in `resetOnUpgrade`) to push new defaults
 
     // Hands (Vision hand pose -> 3D hands)
     var handTracking = true
@@ -68,6 +68,7 @@ struct ViewerProfile: Codable, Equatable {
 
     // Game
     var scene = GameScene.pingPong      // what is placed ahead on a tap
+    var tableTag = true                 // put the table on its AprilTag (ID 67, 102.2 mm) when it's seen
     var tableDropM: Float = 0.80        // table surface below the eyes (standing ~0.8, seated ~0.45)
     var opponentLevel: Float = 0.5      // 0 gentle ... 1 fast
     var assist: Float = 0.5             // 0 realistic ... 1: forgiving paddle, steered shots, slower ball
@@ -76,12 +77,16 @@ struct ViewerProfile: Codable, Equatable {
     var gripOffsetMM: Float = -12       // blade plane along the palm normal (- = into the fist)
     var paddlePrediction: Float = 0     // s the 3D hands lead the camera image (0: exactly on it)
     var gameVolume: Float = 0.8
-    var maxExposureMS: Float = 5        // camera exposure cap (auto below it): less motion blur, more grain; 17 = off
+    var maxExposureMS: Float = 3        // camera exposure cap (auto below it): less motion blur (the paddle's tags stay readable in swings), more grain; 17 = off
 
     // Smart paddle (ArduinoApps/smart-paddle): IMU + AprilTag paddle with haptics, over Wi-Fi
     var smartPaddle = true              // play with it whenever it's connected and calibrated
     var paddleHost = "10.243.94.25"     // the board's address
-    var paddleHaptics: Float = 0.8      // buzz strength on a hit (0 = off)
+    var paddleBladeWidthMM: Float = 150 // the real paddle's size (the drawn one and its hit area match it)
+    var paddleBladeLengthMM: Float = 158
+    var paddleHandleMM: Float = 100
+    var paddleOnCameraImage = true      // the paddle drawn at the camera image's moment (on the real one)
+    var paddleHaptics: Float = 1        // vibration strength on a hit (0 = off); harder hits buzz more
     var paddleTagTurns = -1             // the tag's quarter turns on the blade; -1 = as calibrated
     // Its calibration ("Calibrate paddle", once): IMU <- tag rotation (w x y z; empty = none), clock
     // offset, tag turns and fit residual.
@@ -127,6 +132,8 @@ struct ViewerProfile: Codable, Equatable {
         // The first paddle calibrations were learned from tag poses that sometimes flipped behind the
         // camera: dropped, so the paddle calibrates itself again.
         7: ["paddleMount", "paddleClockOffsetMS", "paddleCalTurns", "paddleCalResidualDeg"],
+        8: ["paddleHaptics"],               // full-strength hit buzz
+        9: ["maxExposureMS"],               // 3 ms: the paddle's tags blur less
     ]
 
     /// Switch headsets: its optics and eye position replace the current ones.

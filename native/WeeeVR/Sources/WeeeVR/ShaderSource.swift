@@ -29,6 +29,7 @@ enum ShaderSource {
         float4 hud;         // HUD top-left offset from each lens centre (px), HUD width, height (px)
         float4 image;       // YCbCr matrix (0 BT.601, 1 BT.709), sharpening, black lift, lens-edge softness
         float4 chroma;      // red, blue tan-angle scale - 1 (lens chromatic aberration), sRGB -> P3 (0/1), 0
+        float4 recording;   // flat view (game recording): 1, tan half-angles x, y, 0 -- else 0
     };
 
     struct VOut { float4 position [[position]]; };
@@ -148,8 +149,9 @@ enum ShaderSource {
     // ---- Ping pong (Game/PingPong.sceneData), all in the table frame (Game/Table.swift): origin at
     // the centre of the playing surface, y up, +z toward the player.
     // scene[0] origin xyz, yaw | [1] cos yaw, sin yaw, floor y, flags (1 ball, 2 player paddle,
-    // 4 opponent paddle) | [2] ball xyz, radius | [3] light direction | [4..7], [8..11] paddles:
-    // blade centre + visible, x, y (toward the tip), z (forehand face) axes.
+    // 4 opponent paddle, 8 stickman) | [2] ball xyz, radius | [3] light direction, w scoreboard |
+    // [4..7], [8..11] paddles: blade centre + visible, x, y (toward the tip), z (forehand face) axes |
+    // [16..28] the stickman's joints (Game/Stickman.swift; [16].w the head's radius).
     constant float kTableHalfLength = 1.37;
     constant float kTableHalfWidth = 0.7625;
     constant float kTableThickness = 0.025;
@@ -162,12 +164,25 @@ enum ShaderSource {
     constant float kHandleHalfWidth = 0.0125;
     constant float kHandleHalfThickness = 0.011;
 
+    // The scoreboard: in the net's plane, beside the table above the left net post, facing the player.
+    constant float kScoreX0 = -1.135;
+    constant float kScoreW = 0.44;
+    constant float kScoreY0 = 0.21;
+    constant float kScoreH = 0.22;
+
     constant int kTableTop = 0;
     constant int kTableFrame = 1;
     constant int kPost = 2;
     constant int kBall = 3;
     constant int kBlade = 4;
     constant int kHandle = 5;
+    constant int kStick = 6;
+
+    // The stickman: limbs as capsules between its joints (scene[16 + i]), and a round head.
+    constant int kStickBase = 16;
+    constant int2 kStickBones[12] = {
+        int2(1, 0), int2(1, 2), int2(1, 3), int2(3, 4), int2(4, 5), int2(1, 6), int2(6, 7), int2(7, 8),
+        int2(2, 9), int2(9, 10), int2(2, 11), int2(11, 12) };
 
     struct SceneHit {
         float t;
@@ -270,13 +285,18 @@ enum ShaderSource {
         float4 c = scene[base];
         if (c.w < 0.5) return;
         float3 X = scene[base + 1].xyz, Y = scene[base + 2].xyz, Z = scene[base + 3].xyz;
-        float3 bc = ro - (c.xyz - Y * 0.06);
-        float bb = dot(rd, bc), cc = dot(bc, bc) - 0.21 * 0.21;
+        // Blade semi-axes and handle length (w of the axes; the standard sizes if not given).
+        float pa = scene[base + 1].w > 0.0 ? scene[base + 1].w : kPaddleA;
+        float pb = scene[base + 2].w > 0.0 ? scene[base + 2].w : kPaddleB;
+        float handle = scene[base + 3].w > 0.0 ? scene[base + 3].w : kHandleLength;
+        float reach = 0.5 * (max(pa, pb) + pb + handle) + 0.02;
+        float3 bc = ro - (c.xyz - Y * (0.5 * (pb + handle) - 0.5 * max(pa, pb)));
+        float bb = dot(rd, bc), cc = dot(bc, bc) - reach * reach;
         if (bb * bb - cc < 0.0 || (bb > 0.0 && cc > 0.0)) return;   // misses its bounding sphere
         float3 o = ro - c.xyz;
         float3 lo = float3(dot(o, X), dot(o, Y), dot(o, Z));
         float3 ld = float3(dot(rd, X), dot(rd, Y), dot(rd, Z));
-        float2 axes = float2(kPaddleA, kPaddleB);
+        float2 axes = float2(pa, pb);
         // Faces.
         if (abs(ld.z) > 1e-6) {
             for (int side = 0; side < 2; side++) {
@@ -285,7 +305,7 @@ enum ShaderSource {
                 if (t <= 0.0 || t >= best.t) continue;
                 float2 q = lo.xy + ld.xy * t;
                 float e = length(q / axes);
-                float cover = saturate((1.0 - e) * kPaddleA / (pixel * t) + 0.5);
+                float cover = saturate((1.0 - e) * pa / (pixel * t) + 0.5);
                 if (cover <= 0.0) continue;
                 best.t = t;
                 best.n = side == 0 ? Z : -Z;
@@ -317,8 +337,8 @@ enum ShaderSource {
         // Handle.
         float3 lr = select(ld, float3(1e-6), abs(ld) < 1e-6);
         float3 hn;
-        float th = boxHit(lo, lr, float3(-kHandleHalfWidth, -kPaddleB - kHandleLength, -kHandleHalfThickness),
-                          float3(kHandleHalfWidth, -kPaddleB + 0.01, kHandleHalfThickness), hn);
+        float th = boxHit(lo, lr, float3(-kHandleHalfWidth, -pb - handle, -kHandleHalfThickness),
+                          float3(kHandleHalfWidth, -pb + 0.01, kHandleHalfThickness), hn);
         if (th > 0.0 && th < best.t) {
             best.t = th;
             best.n = X * hn.x + Y * hn.y + Z * hn.z;
@@ -326,6 +346,43 @@ enum ShaderSource {
             best.which = which;
             best.local = lo + ld * th;
             best.coverage = 1.0;
+        }
+    }
+
+    static void stickHit(float3 ro, float3 rd, constant float4* scene, thread SceneHit& best) {
+        constant float4* j = scene + kStickBase;
+        float3 centre = j[2].xyz + float3(0.0, 0.25, 0.0);
+        float3 oc = ro - centre;
+        float bb = dot(rd, oc);
+        if (bb * bb - (dot(oc, oc) - 1.3 * 1.3) < 0.0) return;      // misses it altogether
+        // Head.
+        float3 oh = ro - j[0].xyz;
+        float hb = dot(rd, oh), hc = dot(oh, oh) - j[0].w * j[0].w, hd = hb * hb - hc;
+        if (hd >= 0.0) {
+            float t = -hb - sqrt(hd);
+            if (t > 0.0 && t < best.t) {
+                best.t = t;
+                best.n = normalize(ro + rd * t - j[0].xyz);
+                best.object = kStick;
+                best.which = -1;
+                best.local = float3(0.0);
+                best.coverage = 1.0;
+            }
+        }
+        // Limbs.
+        for (int i = 0; i < 12; i++) {
+            float3 a = j[kStickBones[i].x].xyz, b = j[kStickBones[i].y].xyz;
+            float r = i < 2 ? 0.026 : 0.021;
+            float t = capsuleHit(ro, rd, a, b, r);
+            if (t > 0.0 && t < best.t) {
+                float3 q = ro + rd * t, ab = b - a;
+                best.t = t;
+                best.n = normalize(q - (a + ab * saturate(dot(q - a, ab) / max(dot(ab, ab), 1e-8))));
+                best.object = kStick;
+                best.which = -1;
+                best.local = float3(0.0);
+                best.coverage = 1.0;
+            }
         }
     }
 
@@ -345,6 +402,7 @@ enum ShaderSource {
         if ((flags & 1) && !skipBall) ballHit(ro, rd, scene[2], pixel, best);
         if ((flags & 2) && skipWhich != 0) paddleHit(ro, rd, scene, 4, 0, pixel, best);
         if ((flags & 4) && skipWhich != 1) paddleHit(ro, rd, scene, 8, 1, pixel, best);
+        if (flags & 8) stickHit(ro, rd, scene, best);
         return best;
     }
 
@@ -389,6 +447,10 @@ enum ShaderSource {
             }
             spec = 0.12;
             shininess = 20.0;
+        } else if (h.object == kStick) {
+            albedo = float3(0.07, 0.07, 0.08);                  // ink black, with a rim light below
+            spec = 0.3;
+            shininess = 30.0;
         } else {
             albedo = float3(0.72, 0.54, 0.34);                  // handle
             spec = 0.1;
@@ -418,17 +480,25 @@ enum ShaderSource {
         float3 ambient = mix(float3(0.32, 0.30, 0.28), float3(0.58, 0.60, 0.64), 0.5 + 0.5 * n.y);
         float diffuse = max(dot(n, L), 0.0) * shadow;
         float specular = pow(max(dot(n, normalize(L - rd)), 0.0), shininess) * spec * shadow;
-        return albedo * (ambient * ao + 0.75 * diffuse) + specular;
+        float3 rim = h.object == kStick ? float3(0.35) * pow(1.0 - saturate(dot(n, -rd)), 3.0) : float3(0.0);
+        return albedo * (ambient * ao + 0.75 * diffuse) + specular + rim;
     }
 
-    // A soft shadow of the table on the (estimated) floor, darkening the passthrough under it.
-    static float floorShadow(float3 ro, float3 rd, float floorY) {
+    // Soft shadows of the table and the stickman on the (estimated) floor, darkening the passthrough.
+    static float floorShadow(float3 ro, float3 rd, constant float4* scene) {
+        float floorY = scene[1].z;
         if (rd.y > -1e-4) return 1.0;
         float t = (floorY - ro.y) / rd.y;
         if (t <= 0.0) return 1.0;
-        float2 q = abs((ro + rd * t).xz);
+        float2 p = (ro + rd * t).xz;
+        float2 q = abs(p);
         float d = max(q.x - kTableHalfWidth, q.y - kTableHalfLength);
-        return 1.0 - 0.28 * (1.0 - smoothstep(-0.25, 0.30, d));
+        float shade = 1.0 - 0.28 * (1.0 - smoothstep(-0.25, 0.30, d));
+        if (int(scene[1].w) & 8) {
+            float s = length(p - scene[kStickBase + 2].xz);
+            shade *= 1.0 - 0.3 * (1.0 - smoothstep(0.08, 0.45, s));
+        }
+        return shade;
     }
 
     // The net: distance along the ray (-1: missed) and the hit's (x, height).
@@ -448,11 +518,14 @@ enum ShaderSource {
                               constant float4* scene [[buffer(2)]],
                               texture2d<float> lumaTex [[texture(0)]],
                               texture2d<float> chromaTex [[texture(1)]],
-                              texture2d<float> hudTex [[texture(2)]]) {
+                              texture2d<float> hudTex [[texture(2)]],
+                              texture2d<float> scoreTex [[texture(3)]]) {
         constexpr sampler s(address::clamp_to_edge, filter::linear);
 
         float2 p = in.position.xy;
-        bool rightEye = p.x >= u.screen.x * 0.5;
+        // The flat view (game recording): a plain perspective picture from between the eyes, no lenses.
+        bool flatView = u.recording.x > 0.5;
+        bool rightEye = !flatView && p.x >= u.screen.x * 0.5;
         float2 lensCentre = float2(rightEye ? u.lens.z : u.lens.x, u.lens.y);
 
         // Screen position as a tan-angle from the lens axis (x right, y up), then the lens's
@@ -460,12 +533,20 @@ enum ShaderSource {
         float2 tanScreen = float2(p.x - lensCentre.x, lensCentre.y - p.y) / (u.screen.z * u.screen.w);
         float r2 = dot(tanScreen, tanScreen);
         float2 tanEye = tanScreen * (1.0 + u.optics.x * r2 + u.optics.y * r2 * r2);
+        // A pixel's size as an angle (edge anti-aliasing).
+        float pixelAngle = u.optics.z / (u.screen.z * u.screen.w) * (1.0 + 3.0 * u.optics.x * r2 + 5.0 * u.optics.y * r2 * r2);
+        if (flatView) {
+            tanEye = float2(p.x / u.screen.x * 2.0 - 1.0, 1.0 - p.y / u.screen.y * 2.0) * u.recording.yz;
+            r2 = 0.0;
+            pixelAngle = 2.0 * u.recording.z / u.screen.y;
+        }
         float3 viewRay = normalize(float3(tanEye * u.optics.z, -1.0));
 
         float3x3 worldFromView = float3x3(u.world0.xyz, u.world1.xyz, u.world2.xyz);
         float3x3 camFromWorld = float3x3(u.camRot0.xyz, u.camRot1.xyz, u.camRot2.xyz);
         float3 worldRay = normalize(worldFromView * viewRay);
-        float3 eye = u.head.xyz + worldFromView * float3((rightEye ? 0.5 : -0.5) * u.cam.z, 0.0, 0.0);
+        float3 eye = flatView ? u.head.xyz
+                              : u.head.xyz + worldFromView * float3((rightEye ? 0.5 : -0.5) * u.cam.z, 0.0, 0.0);
 
         int flags = int(u.optics.w);
 
@@ -481,7 +562,7 @@ enum ShaderSource {
         }
 
         float radius = length(tanEye);
-        if (radius > u.lens.w) {
+        if (!flatView && radius > u.lens.w) {
             return half4(0.0, 0.0, 0.0, 1.0);
         }
 
@@ -537,18 +618,27 @@ enum ShaderSource {
             }
         }
 
-        // Ping pong: the scene in the table frame. Edges of the ball and blades are anti-aliased by
-        // blending with whatever is behind them.
+        // Ping pong, as the camera sees it: this pixel shows the camera image at the sphere point S, and
+        // the scene is traced along that same camera ray, so it lands exactly where the passthrough does
+        // in both eyes (the physics stays in true 3D). In the table frame. Edges of the ball and blades
+        // are anti-aliased by blending with whatever is behind them.
         float sceneT = 1e9;
+        int sceneObject = -1, sceneWhich = -1;
         float netT = -1.0;
         float2 netQ = float2(0.0);
+        float scoreT = -1.0;
+        float4 scoreCol = float4(0.0);
         if (flags & 16) {
-            float pixel = u.optics.z / (u.screen.z * u.screen.w) * (1.0 + 3.0 * u.optics.x * r2 + 5.0 * u.optics.y * r2 * r2);
+            float3 S = eye + rayGreen * seen;
+            float3 camRayOrigin = u.camPos.xyz;
+            float3 camRayDir = normalize(S - camRayOrigin);
+            // A screen pixel's size as an angle seen from the camera (the same patch of sphere).
+            float pixel = pixelAngle * seen / max(length(S - camRayOrigin), 1e-3);
             float cy = scene[1].x, sy = scene[1].y;
-            float3 dw = eye - scene[0].xyz;
+            float3 dw = camRayOrigin - scene[0].xyz;
             float3 tro = float3(cy * dw.x - sy * dw.z, dw.y, sy * dw.x + cy * dw.z);
-            float3 trd = float3(cy * worldRay.x - sy * worldRay.z, worldRay.y, sy * worldRay.x + cy * worldRay.z);
-            float3 passthrough = col * floorShadow(tro, trd, scene[1].z);
+            float3 trd = float3(cy * camRayDir.x - sy * camRayDir.z, camRayDir.y, sy * camRayDir.x + cy * camRayDir.z);
+            float3 passthrough = col * floorShadow(tro, trd, scene);
             SceneHit hit = traceScene(tro, trd, scene, pixel, false, -1);
             if (hit.t < 1e8) {
                 float3 front = shadeScene(hit, tro, trd, scene, pixel);
@@ -560,10 +650,22 @@ enum ShaderSource {
                 }
                 col = front;
                 sceneT = hit.t;
+                sceneObject = hit.object;
+                sceneWhich = hit.which;
             } else {
                 col = passthrough;
             }
             netT = netHit(tro, trd, netQ);
+            // The scoreboard (scene[3].w), facing the player: its texture is premultiplied RGBA.
+            if (scene[3].w > 0.5 && trd.z < -1e-4) {
+                float t = -tro.z / trd.z;
+                float3 q = tro + trd * t;
+                float2 st = float2((q.x - kScoreX0) / kScoreW, 1.0 - (q.y - kScoreY0) / kScoreH);
+                if (t > 0.0 && all(st >= 0.0) && all(st <= 1.0)) {
+                    scoreT = t;
+                    scoreCol = scoreTex.sample(s, st);
+                }
+            }
         }
 
         float handT = 1e9;
@@ -599,11 +701,14 @@ enum ShaderSource {
                     handCol = base * lambert + rim * 0.5;
                 }
             }
-            // In front of the scene only: a hand behind the paddle or the table is hidden by it.
-            if (handT < sceneT) { col = mix(col, handCol, 0.85); }
+            // Hands (on the sphere) and the scene (as the camera sees it) have no common depth: the
+            // paddle in your hand and the ball are drawn over the hands, the hands over the rest.
+            bool heldInFront = sceneObject == kBall || ((sceneObject == kBlade || sceneObject == kHandle) && sceneWhich == 0);
+            if (handT < 1e8 && !heldInFront) { col = mix(col, handCol, 0.85); }
+            else { handT = 1e9; }
         }
 
-        if (netT > 0.0 && netT < min(sceneT, handT)) {
+        if (netT > 0.0 && netT < sceneT && handT >= 1e8) {
             // The net: a translucent dark mesh with a white top band and a cord at the bottom.
             bool band = netQ.y > kNetHeight - 0.015;
             bool cord = netQ.y < 0.005;
@@ -611,9 +716,13 @@ enum ShaderSource {
             col = mix(col, netCol, band || cord ? 1.0 : 0.55);
         }
 
+        if (scoreT > 0.0 && scoreT < sceneT && handT >= 1e8) {
+            col = col * (1.0 - scoreCol.a) + scoreCol.rgb;
+        }
+
         if ((flags & 16) && scene[12].w > 0.0) {
             // Smart paddle: the calibration ring around the big tag where the camera sees it.
-            float pixel = u.optics.z / (u.screen.z * u.screen.w) * (1.0 + 3.0 * u.optics.x * r2 + 5.0 * u.optics.y * r2 * r2);
+            float pixel = pixelAngle;
             float ring = scene[13].w;
             float3 c0 = scene[12].xyz, c1 = scene[13].xyz, c2 = scene[14].xyz, c3 = scene[15].xyz;
             if (ring > -0.5) {
@@ -647,6 +756,8 @@ enum ShaderSource {
                 col = col * (1.0 - h.a) + h.rgb;
             }
         }
+
+        if (flatView) { return half4(half3(saturate(col)), half(1.0)); }
 
         // OLED: lifting black slightly keeps pixels from switching fully off, which smears dark areas
         // when the head turns. Then a soft fade to true black over the outer part of each lens.

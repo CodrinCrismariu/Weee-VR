@@ -36,6 +36,23 @@ final class GameAudio {
         }
     }
 
+    /// What the game plays comes out in this format (nil: no audio).
+    var outputFormat: AVAudioFormat? {
+        queue.sync { running ? engine.mainMixerNode.outputFormat(forBus: 0) : nil }
+    }
+
+    /// Everything the game plays (the mixer's output) also goes to `tap`, or no longer with nil (the
+    /// game recording).
+    func setTap(_ tap: ((AVAudioPCMBuffer, AVAudioTime) -> Void)?) {
+        queue.async { [self] in
+            guard running else { return }
+            engine.mainMixerNode.removeTap(onBus: 0)
+            if let tap {
+                engine.mainMixerNode.installTap(onBus: 0, bufferSize: 2048, format: nil) { buffer, time in tap(buffer, time) }
+            }
+        }
+    }
+
     /// The listener: head position and orientation (world, y up).
     func setListener(position: SIMD3<Float>, forward: SIMD3<Float>, up: SIMD3<Float>) {
         queue.async { [self] in

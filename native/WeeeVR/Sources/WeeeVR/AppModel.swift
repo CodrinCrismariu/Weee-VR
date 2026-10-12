@@ -1,4 +1,5 @@
 import Foundation
+import Photos
 import QuartzCore
 import SwiftUI
 import UIKit
@@ -50,6 +51,18 @@ final class AppModel: ObservableObject {
         engine.onPaddleSmallTagsLearned = { [weak self] turns in
             MainActor.assumeIsolated { self?.viewer.paddleSmallTagTurns = turns }
         }
+        engine.onGameRecording = { [weak self] started, url, inPhotos in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.gameRecording = started
+                if started {
+                    self.gameRecordingResult = nil
+                } else {
+                    self.gameRecordingResult = url.map { "Saved \($0.lastPathComponent)" + (inPhotos ? " (also in Photos)" : " in Files > Weee VR > games") }
+                        ?? "Nothing was recorded"
+                }
+            }
+        }
         engine.start()
         timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.refresh() }
@@ -94,10 +107,37 @@ final class AppModel: ObservableObject {
     func testPaddleBuzz() { engine?.testPaddleBuzz() }
     func calibratePaddleIMU() { engine?.calibratePaddleIMU() }
 
-    /// Closes the settings; the paddle buzzes at the start and twice when the 20 s are saved.
-    func recordPaddle() {
+    /// When the paddle recording running now ends.
+    @Published var paddleRecordingEnds: Date?
+    /// A game is being recorded; the last one's result.
+    @Published var gameRecording = false
+    @Published var gameRecordingResult: String?
+
+    /// Asks for adding to Photos now (not later in the headset), closes the settings and records the next
+    /// game to 11 (it starts at 0-0 once the table is placed).
+    func recordGame() {
+        PHPhotoLibrary.requestAuthorization(for: .addOnly) { _ in
+            DispatchQueue.main.async { [weak self] in
+                self?.showCalibration = false
+                self?.gameRecordingResult = "Starting…"
+                self?.engine?.recordGame()
+            }
+        }
+    }
+
+    func stopGameRecording() { engine?.stopGameRecording() }
+
+    /// Closes the settings; the paddle buzzes at the start and twice when the recording is saved (it
+    /// records while a game is on).
+    func recordPaddle(seconds: Double) {
         showCalibration = false
-        engine?.recordPaddle()
+        paddleRecordingEnds = Date().addingTimeInterval(seconds)
+        engine?.recordPaddle(seconds: seconds)
+    }
+
+    func stopPaddleRecording() {
+        paddleRecordingEnds = nil
+        engine?.stopPaddleRecording()
     }
 
     /// Closes the settings so the camera sees the paddle; it buzzes at the start and twice when done.

@@ -25,6 +25,9 @@ struct GameSettings {
 ///   player's side first); the opponent returns those; a return must bounce once on the player's half.
 ///   Anything else ends the rally. A ball that reaches the floor is replaced at once by a new one on the
 ///   table; otherwise a new ball appears after a moment.
+/// - Score: a rally's point goes to whoever hit last if their ball had landed on the other half, else to
+///   the other side. A game is to 11, won by 2; the next point after a win starts a new game. The
+///   player serves every point (the opponent doesn't serve).
 /// - Assist (`GameSettings.assist`, 0...1), for tracking that is only so precise and so fast:
 ///   the paddle's hit zone grows (up to 1.5x wider, 3 cm in front of and behind the blade); the
 ///   player's shot is blended toward one that clears the net and lands on the opponent's half,
@@ -61,7 +64,16 @@ final class PingPong {
     private(set) var paddle = PaddleState()
     private(set) var rally = 0
     private(set) var best = 0
+    private(set) var playerScore = 0
+    private(set) var opponentScore = 0
+    /// The game's winner, once someone has 11 with a 2-point lead.
+    private(set) var winner: Hitter?
+    /// A point was scored (the player won it).
+    var onPoint: ((Bool) -> Void)?
+    static let gamePoints = 11
     let opponent = Opponent()
+    /// The stick figure playing the opponent's paddle (drawn only).
+    private(set) var stickman = Stickman()
 
     private var realTime: Double?            // the last frame's (display) time
     private var clock = 0.0                  // game time: real time, slowed by the assist
@@ -87,6 +99,19 @@ final class PingPong {
         placed = true
         respawn()
         onEvent?("table placed")
+    }
+
+    /// The table on its tag: surface centre at `centre` (world), its length along `yaw`. Moving a placed
+    /// table keeps the game going (the ball is in the table's frame and moves with it).
+    func anchor(centre: V3, yaw: Double) {
+        let first = !placed
+        self.yaw = yaw
+        origin = centre
+        placed = true
+        if first {
+            respawn()
+            onEvent?("table placed on its tag")
+        }
     }
 
     func toTable(_ p: SIMD3<Float>) -> V3 {
@@ -173,6 +198,7 @@ final class PingPong {
         let span = clock - from
         let previous = paddle
         opponent.update(time: clock)
+        stickman.update(paddle: opponent.paddle, time: clock)
         updatePinch(pinch, time: time)
         if phase == .ready, settings.floatingServe { ball.p = Self.servePoint + V3(0, 0.008 * sin(clock * 2.5), 0) }
 
@@ -333,6 +359,25 @@ final class PingPong {
         guard phase == .inPlay else { return }
         phase = .over(until: t + 1.5)
         onEvent?("rally over: \(reason), rally \(rally), best \(best)")
+        guard lastHitter != .none else { return }
+        // The last hitter's ball had landed on the other half: the receiver failed to return it.
+        let landed = lastHitter == .player ? bouncesOpponent > 0 : bouncesPlayer > 0
+        let playerWins = (lastHitter == .player) == landed
+        if winner != nil { newGame() }
+        if playerWins { playerScore += 1 } else { opponentScore += 1 }
+        if max(playerScore, opponentScore) >= Self.gamePoints, abs(playerScore - opponentScore) >= 2 {
+            winner = playerScore > opponentScore ? .player : .opponent
+        }
+        onEvent?("point to \(playerWins ? "you" : "opponent"): \(playerScore)-\(opponentScore)"
+                 + (winner != nil ? ", game over" : ""))
+        onPoint?(playerWins)
+    }
+
+    /// A new game: 0-0.
+    func newGame() {
+        playerScore = 0
+        opponentScore = 0
+        winner = nil
     }
 
     private func respawn() {
@@ -437,10 +482,11 @@ final class PingPong {
 
     // MARK: Renderer
 
-    /// The scene for the shader (`ShaderSource`, buffer 2), table frame; `sceneCount` float4s. The
-    /// last `overlayCount` are the smart paddle's tag overlay (world frame), filled by the engine.
-    static let sceneCount = 16
+    /// The scene for the shader (`ShaderSource`, buffer 2), table frame; `sceneCount` float4s. [12...15]
+    /// are the smart paddle's tag overlay (world frame), filled by the engine; [16...28] the stickman.
+    static let sceneCount = 32
     static let overlayBase = 12
+    static let stickmanBase = 16
     func sceneData() -> [SIMD4<Float>] {
         var out = [SIMD4<Float>](repeating: .zero, count: Self.sceneCount)
         guard placed else { return out }
@@ -448,16 +494,20 @@ final class PingPong {
         var flags: Float = 1                                   // ball
         if paddle.visible { flags += 2 }
         if opponent.paddle.visible { flags += 4 }
+        flags += 8                                             // the stickman
         out[0] = SIMD4(f3(origin), Float(yaw))
         out[1] = SIMD4(Float(cos(yaw)), Float(sin(yaw)), Float(Table.floorY), flags)
         out[2] = SIMD4(f3(ball.p), Float(Ball.radius))
-        out[3] = SIMD4(f3(vnormalize(V3(0.25, 1.0, 0.35))), 0)
+        out[3] = SIMD4(f3(vnormalize(V3(0.25, 1.0, 0.35))), 1)      // w: the scoreboard shown
         for (i, p) in [paddle, opponent.paddle].enumerated() {
             let base = 4 + 4 * i
             out[base] = SIMD4(f3(p.center), p.visible ? 1 : 0)
-            out[base + 1] = SIMD4(f3(p.basis.x), 0)
-            out[base + 2] = SIMD4(f3(p.basis.y), 0)
-            out[base + 3] = SIMD4(f3(p.basis.z), 0)
+            out[base + 1] = SIMD4(f3(p.basis.x), Float(PaddleShape.semiWidth))
+            out[base + 2] = SIMD4(f3(p.basis.y), Float(PaddleShape.semiLength))
+            out[base + 3] = SIMD4(f3(p.basis.z), Float(PaddleShape.handleLength))
+        }
+        for (i, j) in stickman.joints.enumerated() {
+            out[Self.stickmanBase + i] = SIMD4(f3(j), i == 0 ? Float(Stickman.headRadius) : 0)
         }
         return out
     }
@@ -471,6 +521,6 @@ final class PingPong {
         case .inPlay: state = "in play"
         case .over: state = "point over"
         }
-        return "pong \(state) · rally \(rally) · best \(best)"
+        return "pong \(state) · \(playerScore)-\(opponentScore)\(winner != nil ? " game over" : "") · rally \(rally) · best \(best)"
     }
 }

@@ -6,14 +6,16 @@ import simd
 
 /// Finds the smart paddle's AprilTags (tagStandard41h12) in the passthrough camera frames and
 /// estimates their poses, on its own queue (a frame is skipped while the previous one is still being
-/// processed): ID 0 (69.4 mm black square) on the backhand face, 68 and 69 (27.8 mm) on the forehand.
+/// processed): ID 0 (69.4 mm black square) on the backhand face, 68 and 69 (27.8 mm) on the forehand,
+/// and 67 (102.2 mm) lying on the real table, where the virtual one is placed.
 ///
 /// While the paddle is tracked only a window around it is searched (where the IMU says it is, else
 /// where its tags were), at full resolution when small, which is cheap; otherwise the whole frame
 /// with quads found at half resolution. Fast swings blur the tags away (the IMU carries the paddle
 /// then); they are found again as soon as the paddle slows.
 final class TagTracker {
-    static let tags: [(id: Int32, size: Double)] = [(0, 0.0694), (68, 0.0278), (69, 0.0278)]
+    static let tags: [(id: Int32, size: Double)] = [(0, 0.0694), (68, 0.0278), (69, 0.0278), (67, 0.1022)]
+    static let tableTagID = 67
     static let bigTagSize = 0.0694
 
     struct Solution {
@@ -53,6 +55,7 @@ final class TagTracker {
     private var detector: OpaquePointer?
     private var window: (centre: SIMD2<Double>, size: Double, time: Double)?
     private var reportedIDs: Set<Int> = []
+    private var frameCounter = 0
 
     deinit {
         if let detector { weee_tag_destroy(detector) }
@@ -178,9 +181,9 @@ final class TagTracker {
 
         // Where to look: around the paddle (where the IMU puts it, else where its tags were, with room
         // for it to move between frames); if nothing is there, the whole frame at once.
-        var outs = [WeeeTagDetection](repeating: WeeeTagDetection(), count: 3)
-        func search(_ x0: Int, _ y0: Int, _ w: Int, _ h: Int, decimate: Float) -> Int {
-            camera.withUnsafeBufferPointer { k in
+        func search(_ x0: Int, _ y0: Int, _ w: Int, _ h: Int, decimate: Float) -> [WeeeTagDetection] {
+            var outs = [WeeeTagDetection](repeating: WeeeTagDetection(), count: 4)
+            let n = camera.withUnsafeBufferPointer { k in
                 distortion.withUnsafeBufferPointer { d in
                     ids.withUnsafeBufferPointer { i in
                         sizes.withUnsafeBufferPointer { z in
@@ -192,23 +195,35 @@ final class TagTracker {
                     }
                 }
             }
+            return Array(outs.prefix(n))
         }
-        func searchAround(_ centre: SIMD2<Double>, size: Double) -> Int {
+        func searchAround(_ centre: SIMD2<Double>, size: Double) -> [WeeeTagDetection] {
             let half = max(size * 0.75 + 90, 160)
             let x0 = max(Int(centre.x - half), 0), y0 = max(Int(centre.y - half), 0)
             let w = min(Int(centre.x + half), width) - x0, h = min(Int(centre.y + half), height) - y0
-            guard w >= 32, h >= 32 else { return 0 }
+            guard w >= 32, h >= 32 else { return [] }
             return search(x0, y0, w, h, decimate: max(w, h) > 640 ? 2 : 1)
         }
-        var found = 0
+        var results: [WeeeTagDetection] = []
+        var searchedAll = false
         let recent = window.flatMap { frame.captureTime - $0.time < 0.3 ? $0 : nil }
         let predicted = Self.project(hint, into: frame, flipped: flipped)
-        if let predicted { found = searchAround(predicted.0, size: predicted.1) }
-        if found == 0, let recent, predicted.map({ simd_distance($0.0, recent.centre) > recent.size * 0.3 }) ?? true {
-            found = searchAround(recent.centre, size: recent.size)
+        if let predicted { results = searchAround(predicted.0, size: predicted.1) }
+        if results.isEmpty, let recent, predicted.map({ simd_distance($0.0, recent.centre) > recent.size * 0.3 }) ?? true {
+            results = searchAround(recent.centre, size: recent.size)
         }
-        if found == 0 { found = search(0, 0, width, height, decimate: 2) }
-        guard found > 0 else {
+        if results.isEmpty {
+            results = search(0, 0, width, height, decimate: 2)
+            searchedAll = true
+        }
+        // Every sixth frame the whole frame as well: the table's tag, and anything outside the window.
+        frameCounter += 1
+        if !searchedAll, frameCounter % 6 == 0 {
+            for r in search(0, 0, width, height, decimate: 2) where !results.contains(where: { $0.id == r.id }) {
+                results.append(r)
+            }
+        }
+        guard !results.isEmpty else {
             window = nil
             return []
         }
@@ -218,9 +233,9 @@ final class TagTracker {
         let toView = flipped ? simd_double3x3(diagonal: SIMD3(-1, 1, -1)) : simd_double3x3(diagonal: SIMD3(1, -1, -1))
         var tags: [Tag] = []
         var lo = SIMD2<Double>(repeating: .infinity), hi = SIMD2<Double>(repeating: -.infinity)
-        for out in outs.prefix(found) {
+        for out in results {
             let corners = withUnsafeBytes(of: out.corners) { Array($0.bindMemory(to: Double.self)) }
-            for c in 0..<4 {
+            for c in 0..<4 where Int(out.id) != Self.tableTagID {      // the window follows the paddle only
                 lo = simd_min(lo, SIMD2(corners[2 * c], corners[2 * c + 1]))
                 hi = simd_max(hi, SIMD2(corners[2 * c], corners[2 * c + 1]))
             }
@@ -240,9 +255,13 @@ final class TagTracker {
         }
         // The window: around all the tags seen, as big as the blade would be (a small tag is a fifth
         // of it), so the other tags and the next frame's move fit.
-        let extent = simd_reduce_max(hi - lo)
-        let blade = tags.contains { $0.id == 0 } ? extent * 2.5 : extent * 1.6
-        window = ((lo + hi) / 2, max(blade, 120), frame.captureTime)
+        if lo.x <= hi.x {
+            let extent = simd_reduce_max(hi - lo)
+            let blade = tags.contains { $0.id == 0 } ? extent * 2.5 : extent * 1.6
+            window = ((lo + hi) / 2, max(blade, 120), frame.captureTime)
+        } else {
+            window = nil
+        }
 
         let seen = Set(tags.map(\.id))
         if !seen.isSubset(of: reportedIDs) {

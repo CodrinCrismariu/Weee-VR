@@ -29,6 +29,15 @@ struct CalibrationView: View {
     var body: some View {
         NavigationStack {
             Form {
+                Section {
+                    SliderRow(title: "Vibration strength", value: $model.viewer.paddleHaptics, range: 0...1,
+                              format: "%.0f%%", scale: 100)
+                    Button("Test buzz (a medium hit)") { model.testPaddleBuzz() }
+                } header: {
+                    Text("Paddle vibration")
+                } footer: {
+                    Text("Every ball hit buzzes the paddle: a soft touch short and light, a hard hit long and full power. 0% turns it off.")
+                }
                 Section("Tracking") {
                     Picker("Camera + tracking", selection: $model.viewer.passthrough) {
                         ForEach(Passthrough.allCases, id: \.self) { Text($0.label).tag($0) }
@@ -50,6 +59,15 @@ struct CalibrationView: View {
                     }
                     SliderRow(title: "Table below eyes", value: $model.viewer.tableDropM, range: 0.35...1.0, format: "%.2f m")
                     SliderRow(title: "Assist", value: $model.viewer.assist, range: 0...1, format: "%.0f%%", scale: 100)
+                    if model.gameRecording {
+                        Button("Stop recording the game", role: .destructive) { model.stopGameRecording() }
+                    } else {
+                        Button("Record a game to 11 (video)") { model.recordGame() }
+                    }
+                    if let result = model.gameRecordingResult {
+                        Text(result).font(.footnote).foregroundStyle(.secondary)
+                    }
+                    Toggle("Table on its tag (ID 67)", isOn: $model.viewer.tableTag)
                     Toggle("Floating serve ball", isOn: $model.viewer.floatingServe)
                     SliderRow(title: "Opponent level", value: $model.viewer.opponentLevel, range: 0...1, format: "%.2f")
                     SliderRow(title: "Sound volume", value: $model.viewer.gameVolume, range: 0...1, format: "%.2f")
@@ -61,10 +79,14 @@ struct CalibrationView: View {
                 } header: {
                     Text("Game")
                 } footer: {
-                    Text("Tap places the table ahead of you. Pinch the ball (thumb + index) with your left hand to pick it up, open to toss; the paddle is in your right hand. Assist: a bigger hit zone, shots steered onto the table, a slower ball, a clean toss and friendlier returns (0% = realistic). Table height: standing ~0.8 m below the eyes, seated ~0.45 m.")
+                    Text("Tap places the table ahead of you. Pinch the ball (thumb + index) with your left hand to pick it up, open to toss; the paddle is in your right hand. Assist: a bigger hit zone, shots steered onto the table, a slower ball, a clean toss and friendlier returns (0% = realistic). Table height: standing ~0.8 m below the eyes, seated ~0.45 m. Score: first to 11, by 2; you serve every point. Record a game: the score restarts at 0-0 and the video (what the passthrough shows, seen from between your eyes, with the game's sounds) stops a few seconds after the game ends; it goes to Photos and Files > Weee VR > games.")
                 }
                 Section {
                     Toggle("Smart paddle", isOn: $model.viewer.smartPaddle)
+                    Toggle("Paddle on the camera image", isOn: $model.viewer.paddleOnCameraImage)
+                    SliderRow(title: "Blade width", value: $model.viewer.paddleBladeWidthMM, range: 120...220, format: "%.0f mm")
+                    SliderRow(title: "Blade length", value: $model.viewer.paddleBladeLengthMM, range: 120...240, format: "%.0f mm")
+                    SliderRow(title: "Handle length", value: $model.viewer.paddleHandleMM, range: 60...160, format: "%.0f mm")
                     LabeledContent("Board address") {
                         TextField("10.243.94.25", text: $paddleHost)
                             .multilineTextAlignment(.trailing)
@@ -73,9 +95,18 @@ struct CalibrationView: View {
                             .autocorrectionDisabled()
                             .onSubmit { model.viewer.paddleHost = paddleHost }
                     }
-                    SliderRow(title: "Hit buzz", value: $model.viewer.paddleHaptics, range: 0...1, format: "%.0f%%", scale: 100)
-                    Button("Test buzz") { model.testPaddleBuzz() }
-                    Button("Record paddle data (20 s, for debugging)") { model.recordPaddle() }
+                    if let ends = model.paddleRecordingEnds, ends > Date() {
+                        Button("Stop recording and save (\(Int(ends.timeIntervalSinceNow)) s left)") {
+                            model.stopPaddleRecording()
+                        }
+                    } else {
+                        Menu("Record paddle data (for tuning)") {
+                            Button("20 seconds") { model.recordPaddle(seconds: 20) }
+                            Button("1 minute") { model.recordPaddle(seconds: 60) }
+                            Button("3 minutes") { model.recordPaddle(seconds: 180) }
+                            Button("5 minutes") { model.recordPaddle(seconds: 300) }
+                        }
+                    }
                     Button("Calibrate IMU (paddle lying still, once)") { model.calibratePaddleIMU() }
                     Button(model.viewer.paddleCalibration == nil ? "Calibrate paddle (once)" : "Recalibrate paddle") {
                         model.calibratePaddle()

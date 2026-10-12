@@ -103,7 +103,76 @@ enum GameSelfTest {
         }
         out.append("assist 1, sloppy serve: table contacts \(landings) (first z < 0 = on the opponent's half), opponent returns \(assisted.best) (expect 1)")
         out.append(contentsOf: paddleFusion())
+        out.append(tableAnchorTest())
+        out.append(stickmanTest())
         return out
+    }
+
+    /// 7. The table on its tag: noisy sightings of a still tag (2 cm, 3°, from 1-2 m) keep it steady;
+    ///    the tag moved 40 cm moves it (after a few sightings, gliding).
+    /// The stickman through one of the opponent's returns: its hand stays on the paddle's grip, its feet
+    /// on the floor, its body behind the end line, and its bones keep their lengths.
+    static func stickmanTest() -> String {
+        // A player's shot (Opponent.aim, mirrored to fly toward the opponent), flown to the net.
+        guard let (v, w) = Opponent.aim(from: V3(0.1, 0.3, -1.3), to: V3(-0.2, Ball.radius, 0.7), speed: 6, topspin: 80)
+        else { return "FAIL stickman: no shot" }
+        var ball = Ball(at: V3(0.1, 0.3, 1.3))
+        ball.v = V3(v.x, v.y, -v.z)
+        ball.w = V3(-w.x, -w.y, w.z)
+        var t = 0.0
+        while ball.p.z > 0 { Physics.fly(&ball); t += Physics.dt }
+        let opponent = Opponent()
+        opponent.misses = false
+        opponent.plan(ball: ball, time: t)
+        opponent.waitForPlan()
+        var man = Stickman()
+        var handGap = 0.0, footLow = 0.0, front = -9.0, boneError = 0.0, reachGap = 0.0
+        var moved = 0.0, first: V3?
+        for _ in 0..<150 {
+            t += 1.0 / 60
+            opponent.update(time: t)
+            man.update(paddle: opponent.paddle, time: t)
+            let j = man.joints, p = opponent.paddle
+            let grip = p.center - p.basis.y * (PaddleShape.semiLength + PaddleShape.handleLength * 0.6)
+            handGap = max(handGap, vlength(j[5] - grip))
+            reachGap = max(reachGap, vlength(grip - j[3]) - Stickman.upperArm - Stickman.forearm)
+            footLow = max(footLow, abs(min(j[10].y, j[12].y) - Table.floorY - 0.02))
+            front = max(front, j[2].z)
+            for (a, b, l) in [(3, 4, Stickman.upperArm), (4, 5, Stickman.forearm), (2, 9, Stickman.thigh), (9, 10, Stickman.shin)] {
+                boneError = max(boneError, abs(vlength(j[a] - j[b]) - l))
+            }
+            if first == nil { first = j[2] }
+            moved = max(moved, vlength(j[2] - first!))
+        }
+        let ok = handGap < 0.03 && boneError < 0.002 && front < -Table.halfLength
+        return String(format: "%@stickman: hand %.1f cm from the grip at worst, bones off %.1f mm, lowest foot %.1f cm off the floor, pelvis z <= %.2f (end line %.2f), moved %.2f m",
+                      ok ? "" : "FAIL ", handGap * 100, boneError * 1000, footLow * 100, front, -Table.halfLength, moved)
+    }
+
+    static func tableAnchorTest() -> String {
+        var rng = GameRandom(seed: 5)
+        var anchor = TableAnchor()
+        let camera = V3(0, 1.6, 1.5), head = camera
+        func sighting(at centre: V3) -> [(rotation: Quat, position: V3)] {
+            // Lying flat (z down), one edge along -z, with noise; the planar ambiguity's twin tilted.
+            let flat = Quat(rotationVector: V3(.pi / 2, 0, 0)) * Quat(rotationVector: V3(0, 0, rng.uniform(-0.05, 0.05)))
+            let tilt = Quat(rotationVector: V3(rng.uniform(-0.03, 0.03), 0, rng.uniform(-0.03, 0.03)))
+            let noise = V3(rng.uniform(-0.02, 0.02), rng.uniform(-0.01, 0.01), rng.uniform(-0.02, 0.02))
+            return [((tilt * flat).normalized, centre + noise), ((Quat(rotationVector: V3(0.5, 0, 0)) * flat).normalized, centre)]
+        }
+        var t = 0.0, steady: [V3] = [], movedAt: Double?
+        let first = V3(0, 0.76, 0), second = V3(0.4, 0.76, 0)
+        while t < 8 {
+            t += 1.0 / 30
+            anchor.add(candidates: sighting(at: t < 5 ? first : second), camera: camera, head: head, time: t)
+            if let s = anchor.shown(at: t) {
+                if t > 1, t < 5 { steady.append(s.centre) }
+                if t > 5, movedAt == nil, vlength(s.centre - second) < 0.02 { movedAt = t }
+            }
+        }
+        let worst = steady.map { vlength($0 - first) }.max() ?? .nan
+        return String(format: "table anchor: still tag held within %.1f mm (noise 20 mm); moved tag followed after %.2f s",
+                      worst * 1000, (movedAt ?? .nan) - 5)
     }
 
     /// 6. The smart paddle: a simulated paddle turned in view for the calibration (unknown IMU mount,
@@ -113,6 +182,7 @@ enum GameSelfTest {
     static func paddleFusion() -> [String] {
         var rng = GameRandom(seed: 11)
         func noise(_ scale: Double) -> V3 { V3(rng.uniform(-1, 1), rng.uniform(-1, 1), rng.uniform(-1, 1)) * scale }
+        var accelRng = GameRandom(seed: 23)
         let mount = Quat(rotationVector: V3(0.4, -1.1, 2.0))              // IMU <- tag
         let turns = 1
         let tagFromPaddle = Quat(rotationVector: V3(0, 0, Double(turns) * .pi / 2))
@@ -169,10 +239,23 @@ enum GameSelfTest {
             while nextIMU <= t - 0.005 {
                 let b = imuOrientation(nextIMU)
                 let rate = (b.conjugate * imuOrientation(nextIMU + 1e-4)).rotationVector / 1e-4
-                fusion.add([PaddleIMUSample(time: nextIMU + timeOffset, orientation: b, rate: rate, still: false)])
+                // The accelerometer at the blade centre: its acceleration plus 1 g up, in the IMU's frame,
+                // with noise and a bias.
+                func centre(_ t: Double) -> V3 { let (r, g) = paddle(t); return g - r.act(PaddleFusion.gripFromCentre) }
+                let h = 1e-3
+                let a = (centre(nextIMU + h) - centre(nextIMU) * 2 + centre(nextIMU - h)) / (h * h)
+                let trueIMU = heading.conjugate * (paddle(nextIMU).rotation * tagFromPaddle.conjugate) * mount.conjugate
+                let f = trueIMU.conjugate.act(heading.conjugate.act(a + V3(0, 9.81, 0))) / 9.81
+                    + V3(0.02, -0.01, 0.015) + V3(accelRng.uniform(-1, 1), accelRng.uniform(-1, 1), accelRng.uniform(-1, 1)) * 0.02
+                fusion.add([PaddleIMUSample(time: nextIMU + timeOffset, orientation: b, rate: rate, still: false, accel: f)])
                 nextIMU += 0.005
             }
             fusion.tick(time: t)
+            // A wrong big-tag turn (as an unlucky calibration might find): the small tags must fix it.
+            if t >= 13, t - dt < 13, var wrong = fusion.calibration {
+                wrong.tagTurns = (wrong.tagTurns + 2) % 4
+                fusion.calibration = wrong
+            }
             if t >= nextFrame {
                 let (r, g) = paddle(nextFrame)
                 let gap = nextFrame > 11 && nextFrame < 11.4
@@ -198,7 +281,7 @@ enum GameSelfTest {
                 let pos = vlength(pose.center - centre)
                 let ang = Quat.angle(Quat(basis: pose.basis), r)
                 if t > 11, t < 11.5 { errors.gapPos.append(pos); errors.gapAng.append(ang) }
-                else if t < 14 { errors.pos.append(pos); errors.ang.append(ang) }
+                else if t < 13 { errors.pos.append(pos); errors.ang.append(ang) }
                 else if t > 16 { smallErrors.pos.append(pos); smallErrors.ang.append(ang) }
             }
         }
@@ -212,6 +295,7 @@ enum GameSelfTest {
         out.append(String(format: "paddle tracking: worst %.1f mm / %.2f° with the tag, %.1f mm / %.2f° in a 0.4 s tag gap (%d + %d poses)",
                           worst(errors.pos) * 1000, worst(errors.ang) * 180 / .pi,
                           worst(errors.gapPos) * 1000, worst(errors.gapAng) * 180 / .pi, errors.pos.count, errors.gapPos.count))
+        out.append("paddle big tag turns after a wrong one at 13 s: \(fusion.calibration?.tagTurns ?? -1) (true \(turns))")
         out.append(String(format: "paddle small tags: learned turns %@ (true 68:1 69:3), worst %.1f mm / %.2f° from them (%d poses)",
                           fusion.smallTurns.sorted { $0.key < $1.key }.map { "\($0.key):\($0.value)" }.joined(separator: " "),
                           worst(smallErrors.pos) * 1000, worst(smallErrors.ang) * 180 / .pi, smallErrors.pos.count))

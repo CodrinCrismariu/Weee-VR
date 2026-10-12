@@ -21,6 +21,7 @@ struct Uniforms {
     var hud = SIMD4<Float>()
     var image = SIMD4<Float>()      // YCbCr matrix (0 BT.601, 1 BT.709), sharpening, black lift, edge softness
     var chroma = SIMD4<Float>()     // red / blue tan-angle scale - 1 (lens CA), P3 colour fix (0/1), 0
+    var recording = SIMD4<Float>()  // flat view (game recording): 1, tan half-angles x, y, 0
 
     mutating func setCameraFromWorld(_ m: simd_float3x3) {
         camRot0 = SIMD4(m.columns.0, 0); camRot1 = SIMD4(m.columns.1, 0); camRot2 = SIMD4(m.columns.2, 0)
@@ -40,6 +41,7 @@ final class Renderer {
 
     private let hudLock = NSLock()
     private var hudTexture: MTLTexture?
+    private var scoreTexture: MTLTexture?
 
     init(device: MTLDevice, pixelFormat: MTLPixelFormat) throws {
         self.device = device
@@ -65,6 +67,13 @@ final class Renderer {
         hudLock.unlock()
     }
 
+    /// The scoreboard's texture (premultiplied RGBA), drawn on the table (ScoreRasterizer).
+    func setScore(_ texture: MTLTexture?) {
+        hudLock.lock()
+        scoreTexture = texture
+        hudLock.unlock()
+    }
+
     var hasHUD: Bool {
         hudLock.lock()
         defer { hudLock.unlock() }
@@ -85,6 +94,7 @@ final class Renderer {
         if let frame, let luma = frame.lumaTexture, let chroma = frame.chromaTexture {
             hudLock.lock()
             let hud = hudTexture ?? emptyTexture
+            let score = scoreTexture ?? emptyTexture
             hudLock.unlock()
 
             pass.colorAttachments[0].loadAction = .dontCare   // the triangle covers every pixel
@@ -97,12 +107,14 @@ final class Renderer {
                 encoder.setFragmentTexture(luma, index: 0)
                 encoder.setFragmentTexture(chroma, index: 1)
                 encoder.setFragmentTexture(hud, index: 2)
+                encoder.setFragmentTexture(score, index: 3)
                 encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
                 encoder.endEncoding()
             }
             commandBuffer.addCompletedHandler { buffer in
                 withExtendedLifetime(frame) {}
                 withExtendedLifetime(hud) {}
+                withExtendedLifetime(score) {}
                 completed(max(buffer.gpuEndTime - buffer.gpuStartTime, 0))
             }
         } else {
@@ -115,6 +127,40 @@ final class Renderer {
             if d.presentedTime > 0 { presented(d.presentedTime) }
         }
         commandBuffer.present(drawable)
+        commandBuffer.commit()
+    }
+
+    /// The same picture as a flat view (`uniforms.recording`) into `target` (a video frame), in its own
+    /// command buffer after the frame's, so it never delays the headset's frame. `completed` runs once
+    /// the GPU has written it.
+    func drawRecording(into target: MTLTexture, frame: CameraFrame, uniforms: Uniforms, hands: [SIMD4<Float>],
+                       scene: [SIMD4<Float>], completed: @escaping () -> Void) {
+        guard let luma = frame.lumaTexture, let chroma = frame.chromaTexture,
+              let commandBuffer = queue.makeCommandBuffer() else { return }
+        let pass = MTLRenderPassDescriptor()
+        pass.colorAttachments[0].texture = target
+        pass.colorAttachments[0].loadAction = .dontCare
+        pass.colorAttachments[0].storeAction = .store
+        hudLock.lock()
+        let score = scoreTexture ?? emptyTexture
+        hudLock.unlock()
+        guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: pass) else { return }
+        var u = uniforms
+        encoder.setRenderPipelineState(pipeline)
+        encoder.setFragmentBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 0)
+        hands.withUnsafeBytes { encoder.setFragmentBytes($0.baseAddress!, length: $0.count, index: 1) }
+        scene.withUnsafeBytes { encoder.setFragmentBytes($0.baseAddress!, length: $0.count, index: 2) }
+        encoder.setFragmentTexture(luma, index: 0)
+        encoder.setFragmentTexture(chroma, index: 1)
+        encoder.setFragmentTexture(emptyTexture, index: 2)
+        encoder.setFragmentTexture(score, index: 3)
+        encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+        encoder.endEncoding()
+        commandBuffer.addCompletedHandler { _ in
+            withExtendedLifetime(frame) {}
+            withExtendedLifetime(score) {}
+            completed()
+        }
         commandBuffer.commit()
     }
 }
