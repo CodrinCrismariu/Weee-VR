@@ -12,6 +12,7 @@ final class AppModel: ObservableObject {
     @Published var showCalibration = false
     @Published var calibrationResult: String?
     @Published var paddleStatus = ""
+    @Published var mqttStatus = ""
 
     @Published var viewer = ViewerProfile.load() {
         didSet {
@@ -179,6 +180,7 @@ final class AppModel: ObservableObject {
         let p = status.position
         let memory = Self.memoryFootprintMB()
         if paddleStatus != status.paddleMessage { paddleStatus = status.paddleMessage }
+        if mqttStatus != status.mqttMessage { mqttStatus = status.mqttMessage }
 
         if showHUD {
             var lines = [

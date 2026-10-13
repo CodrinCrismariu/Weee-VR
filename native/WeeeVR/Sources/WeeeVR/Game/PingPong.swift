@@ -70,6 +70,12 @@ final class PingPong {
     private(set) var winner: Hitter?
     /// A point was scored (the player won it).
     var onPoint: ((Bool) -> Void)?
+    /// My hits in a row in this rally that landed on the opponent's half, and the best such run this
+    /// session (the score posted over MQTT).
+    private(set) var streak = 0
+    private(set) var record = 0
+    /// The record rose.
+    var onRecord: ((Int) -> Void)?
     static let gamePoints = 11
     let opponent = Opponent()
     /// The stick figure playing the opponent's paddle (drawn only).
@@ -283,6 +289,7 @@ final class PingPong {
                     if serve, bouncesPlayer == 0, bouncesOpponent == 0 { bouncesPlayer = 1 } else { endRally("bounced on your side", at: t) }
                 } else if bouncesOpponent == 0 {
                     bouncesOpponent = 1
+                    countHit()
                 } else {
                     endRally("opponent missed", at: t)
                 }
@@ -355,9 +362,19 @@ final class PingPong {
         best = max(best, rally)
     }
 
+    /// A hit of mine landed legally on the opponent's half: the run of continuous hits grows.
+    private func countHit() {
+        streak += 1
+        if streak > record {
+            record = streak
+            onRecord?(record)
+        }
+    }
+
     private func endRally(_ reason: String, at t: Double) {
         guard phase == .inPlay else { return }
         phase = .over(until: t + 1.5)
+        streak = 0
         onEvent?("rally over: \(reason), rally \(rally), best \(best)")
         guard lastHitter != .none else { return }
         // The last hitter's ball had landed on the other half: the receiver failed to return it.
@@ -388,6 +405,7 @@ final class PingPong {
         bouncesPlayer = 0
         bouncesOpponent = 0
         rally = 0
+        streak = 0
         restingSince = nil
         opponent.reset()
     }
@@ -437,6 +455,7 @@ final class PingPong {
                 phase = .held
                 lastHitter = .none
                 rally = 0
+                streak = 0
                 opponent.reset()
             }
         }

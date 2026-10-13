@@ -35,6 +35,7 @@ final class VREngine: NSObject, CAMetalDisplayLinkDelegate {
         var gameInfo: String?
         var paddleInfo: String?
         var paddleMessage: String
+        var mqttMessage = "off"
         var position: SIMD3<Float>
         var depth: Float
         var attachedIntrinsics: Bool
@@ -67,6 +68,7 @@ final class VREngine: NSObject, CAMetalDisplayLinkDelegate {
     private let gameAudio = GameAudio()
     private let palmGesture = PalmGesture()          // render thread only
     private let paddleLink = PaddleLink()            // the smart paddle's IMU stream and haptics
+    private let scorePublisher = MQTTPublisher()     // the record of continuous hits, over MQTT
     private let tags = TagTracker()                  // its AprilTag in the camera frames
     private let paddleFusion = PaddleFusion()        // render thread only
     /// The smart paddle finished its one-time calibration (save it in the profile).
@@ -171,6 +173,10 @@ final class VREngine: NSObject, CAMetalDisplayLinkDelegate {
         }
         paddleLink.onMessage = { Log.info("paddle link: \($0)") }
         paddleLink.connect(to: viewer.smartPaddle ? viewer.paddleHost : nil)
+        scorePublisher.onMessage = { Log.info($0) }
+        game.onRecord = { [scorePublisher] record in scorePublisher.publish(Self.scorePayload(record)) }
+        scorePublisher.start(host: viewer.mqttEnabled ? viewer.mqttHost : nil, topic: viewer.mqttTopic)
+        scorePublisher.publish(Self.scorePayload(0))
         tags.enabled = (viewer.smartPaddle || viewer.tableTag) && viewer.scene == .pingPong
         tags.flipped = viewer.flipCamera
         gameAudio.volume = viewer.gameVolume
@@ -300,6 +306,7 @@ final class VREngine: NSObject, CAMetalDisplayLinkDelegate {
         lock.unlock()
         let paddleHost = viewer.smartPaddle ? viewer.paddleHost : nil
         if paddleHost != oldPaddleHost { paddleLink.connect(to: paddleHost) }
+        scorePublisher.start(host: viewer.mqttEnabled ? viewer.mqttHost : nil, topic: viewer.mqttTopic)
         gameAudio.volume = viewer.gameVolume
         if restart { startCurrentSource() }
         if exposureChanged, !restart, newMode != .arkit { avSource.capExposure(to: viewer.exposureCap) }
@@ -361,6 +368,9 @@ final class VREngine: NSObject, CAMetalDisplayLinkDelegate {
         gameRecordStop = true
         lock.unlock()
     }
+
+    /// The record of continuous hits as the MQTT payload: a float, e.g. "7.0".
+    private static func scorePayload(_ record: Int) -> String { String(format: "%.1f", Double(record)) }
 
     /// One-time gyro bias measurement on the board (the paddle lying still for ~2 s).
     func calibratePaddleIMU() { paddleLink.calibrateIMU() }
@@ -435,9 +445,10 @@ final class VREngine: NSObject, CAMetalDisplayLinkDelegate {
         let before = table.anchor
         table.add(candidates: candidates, camera: V3(p.x, p.y, p.z),
                   head: V3(Double(head.x), Double(head.y), Double(head.z)), time: detection.captureTime)
-        if let a = table.anchor, before == nil || vlength(a.centre - before!.centre) > 0.1 {
-            Log.info(String(format: "table: on tag 67 at %.2f %.2f %.2f, heading %.0f°", a.centre.x, a.centre.y, a.centre.z,
-                            a.yaw * 180 / .pi))
+        if let a = table.anchor, before == nil || vlength(a.centre - before!.centre) > 0.1
+            || abs(TableAnchor.wrap(a.yaw - before!.yaw)) > 5 * Double.pi / 180 {
+            Log.info(String(format: "table: on tag 67 at %.2f %.2f %.2f, heading %.0f° (head at %.2f %.2f %.2f, label side %d)",
+                            a.centre.x, a.centre.y, a.centre.z, a.yaw * 180 / .pi, head.x, head.y, head.z, table.labelSide))
         }
     }
 
@@ -632,6 +643,7 @@ final class VREngine: NSObject, CAMetalDisplayLinkDelegate {
         lock.unlock()
         status.tracking = mode == .arkit ? arSource.trackingState : mode == .xrslam ? xrSource.trackingState : nil
         status.slamInfo = mode == .xrslam ? xrSource.info : nil
+        status.mqttMessage = scorePublisher.status
         status.handsInfo = handTracking ? handsInfo(shown: handCount) : nil
         status.attachedIntrinsics = status.attachedIntrinsics || avSource.usingAttachedIntrinsics
         if smartPaddle {
@@ -971,6 +983,10 @@ final class VREngine: NSObject, CAMetalDisplayLinkDelegate {
             newTags = detection
         }
         if playing, vp.tableTag {
+            if table.labelSide != vp.tableTagLabel {
+                table.labelSide = vp.tableTagLabel
+                table.reset()                                  // placed again, the new way round
+            }
             if let newTags { anchorTable(newTags, head: head) }
             applyTable(time: CACurrentMediaTime())
         }

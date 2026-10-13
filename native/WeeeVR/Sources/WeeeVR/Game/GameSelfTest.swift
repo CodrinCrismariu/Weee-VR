@@ -61,6 +61,8 @@ enum GameSelfTest {
         var sounds = [Int](repeating: 0, count: GameSound.allCases.count)
         game.onEvent = { events.append($0) }
         game.onSound = { kind, _, _ in sounds[kind.rawValue] += 1 }
+        var records: [Int] = []
+        game.onRecord = { records.append($0) }
         game.placeForTest()
         game.opponent.misses = false
         // The player's shot: aimed like the opponent's, mirrored to go from the player's side.
@@ -78,6 +80,10 @@ enum GameSelfTest {
                 game.opponent.waitForPlan()
             }
             out.append("exchange: opponent returns \(game.best) (expect 1), events \(events), sounds paddle/table/net/floor \(sounds)")
+            // The posted score: my shot landed on the opponent's half once, so the record is 1 (posted
+            // once), and the run starts again from 0 when the rally ends.
+            let scoreOK = records == [1] && game.record == 1 && game.streak == 0
+            out.append("\(scoreOK ? "" : "FAIL ")continuous hits: record \(game.record) posted as \(records) (expect [1]), streak after the rally \(game.streak) (expect 0)")
         } else {
             out.append("FAIL player test shot")
         }
@@ -105,6 +111,7 @@ enum GameSelfTest {
         out.append(contentsOf: paddleFusion())
         out.append(tableAnchorTest())
         out.append(stickmanTest())
+        out.append(mqttPacketTest())
         return out
     }
 
@@ -112,6 +119,19 @@ enum GameSelfTest {
     ///    the tag moved 40 cm moves it (after a few sightings, gliding).
     /// The stickman through one of the opponent's returns: its hand stays on the paddle's grip, its feet
     /// on the floor, its body behind the end line, and its bones keep their lengths.
+    /// The MQTT packets against bytes worked out by hand from the 3.1.1 spec.
+    static func mqttPacketTest() -> String {
+        let connect = MQTTPacket.connect(clientID: "a", keepAlive: 30)
+        let expectConnect: [UInt8] = [0x10, 0x0D, 0x00, 0x04, 0x4D, 0x51, 0x54, 0x54, 0x04, 0x02, 0x00, 0x1E, 0x00, 0x01, 0x61]
+        let publish = MQTTPacket.publish(topic: "a/b", payload: "7.0", retain: true)
+        let expectPublish: [UInt8] = [0x31, 0x08, 0x00, 0x03, 0x61, 0x2F, 0x62, 0x37, 0x2E, 0x30]
+        let ok = connect == expectConnect && publish == expectPublish
+            && MQTTPacket.remainingLength(321) == [0xC1, 0x02] && MQTTPacket.remainingLength(127) == [0x7F]
+            && MQTTPacket.connectAck([0x20, 0x02, 0x00, 0x00]) == 0
+        return ok ? "mqtt packets: connect, publish (retained), remaining length and connack match the spec"
+                  : "FAIL mqtt packets: \(connect) \(publish)"
+    }
+
     static func stickmanTest() -> String {
         // A player's shot (Opponent.aim, mirrored to fly toward the opponent), flown to the net.
         guard let (v, w) = Opponent.aim(from: V3(0.1, 0.3, -1.3), to: V3(-0.2, Ball.radius, 0.7), speed: 6, topspin: 80)
@@ -160,19 +180,30 @@ enum GameSelfTest {
             let noise = V3(rng.uniform(-0.02, 0.02), rng.uniform(-0.01, 0.01), rng.uniform(-0.02, 0.02))
             return [((tilt * flat).normalized, centre + noise), ((Quat(rotationVector: V3(0.5, 0, 0)) * flat).normalized, centre)]
         }
-        var t = 0.0, steady: [V3] = [], movedAt: Double?
+        var t = 0.0, steady: [TableAnchor.Pose] = [], movedAt: Double?, placedAt: Double?
         let first = V3(0, 0.76, 0), second = V3(0.4, 0.76, 0)
-        while t < 8 {
+        while t < 9 {
             t += 1.0 / 30
             anchor.add(candidates: sighting(at: t < 5 ? first : second), camera: camera, head: head, time: t)
             if let s = anchor.shown(at: t) {
-                if t > 1, t < 5 { steady.append(s.centre) }
+                if placedAt == nil { placedAt = t }
+                if t > 1.5, t < 5 { steady.append(s) }
                 if t > 5, movedAt == nil, vlength(s.centre - second) < 0.02 { movedAt = t }
             }
         }
-        let worst = steady.map { vlength($0 - first) }.max() ?? .nan
-        return String(format: "table anchor: still tag held within %.1f mm (noise 20 mm); moved tag followed after %.2f s",
-                      worst * 1000, (movedAt ?? .nan) - 5)
+        // Held: the furthest from the true spot, the heading's error, and how far the far end of the table
+        // (2 m away) travelled in total while the tag lay still (the wobble that makes one dizzy).
+        let worst = steady.map { vlength($0.centre - first) }.max() ?? .nan
+        let yawError = steady.map { abs(TableAnchor.wrap($0.yaw)) }.max() ?? .nan
+        var farTravel = 0.0
+        for i in 1..<max(steady.count, 1) {
+            func far(_ p: TableAnchor.Pose) -> V3 { p.centre + V3(-sin(p.yaw), 0, -cos(p.yaw)) * 2 }
+            farTravel += vlength(far(steady[i]) - far(steady[i - 1]))
+        }
+        let ok = worst < 0.02 && yawError < 2 * Double.pi / 180 && farTravel < 0.05 && movedAt != nil
+        return String(format: "%@table anchor: placed after %.2f s; still tag held within %.1f mm, %.2f° (noise 20 mm, 3°), far end moved %.1f mm in 3.5 s; moved tag followed after %.2f s",
+                      ok ? "" : "FAIL ", placedAt ?? .nan, worst * 1000, yawError * 180 / .pi, farTravel * 1000,
+                      (movedAt ?? .nan) - 5)
     }
 
     /// 6. The smart paddle: a simulated paddle turned in view for the calibration (unknown IMU mount,

@@ -25,6 +25,8 @@ struct CalibrationView: View {
     @EnvironmentObject private var model: AppModel
     @Environment(\.dismiss) private var dismiss
     @State private var paddleHost = ""
+    @State private var mqttHost = ""
+    @State private var mqttTopic = ""
 
     var body: some View {
         NavigationStack {
@@ -68,6 +70,12 @@ struct CalibrationView: View {
                         Text(result).font(.footnote).foregroundStyle(.secondary)
                     }
                     Toggle("Table on its tag (ID 67)", isOn: $model.viewer.tableTag)
+                    Picker("Tag 67's label faces", selection: $model.viewer.tableTagLabel) {
+                        Text("Me").tag(0)
+                        Text("The far end").tag(1)
+                        Text("My left").tag(2)
+                        Text("My right").tag(3)
+                    }
                     Toggle("Floating serve ball", isOn: $model.viewer.floatingServe)
                     SliderRow(title: "Opponent level", value: $model.viewer.opponentLevel, range: 0...1, format: "%.2f")
                     SliderRow(title: "Sound volume", value: $model.viewer.gameVolume, range: 0...1, format: "%.2f")
@@ -80,6 +88,27 @@ struct CalibrationView: View {
                     Text("Game")
                 } footer: {
                     Text("Tap places the table ahead of you. Pinch the ball (thumb + index) with your left hand to pick it up, open to toss; the paddle is in your right hand. Assist: a bigger hit zone, shots steered onto the table, a slower ball, a clean toss and friendlier returns (0% = realistic). Table height: standing ~0.8 m below the eyes, seated ~0.45 m. Score: first to 11, by 2; you serve every point. Record a game: the score restarts at 0-0 and the video (what the passthrough shows, seen from between your eyes, with the game's sounds) stops a few seconds after the game ends; it goes to Photos and Files > Weee VR > games.")
+                }
+                Section {
+                    Toggle("Post score over MQTT", isOn: $model.viewer.mqttEnabled)
+                    LabeledContent("Broker") {
+                        TextField("test.mosquitto.org", text: $mqttHost)
+                            .multilineTextAlignment(.trailing)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                            .onSubmit { model.viewer.mqttHost = mqttHost }
+                    }
+                    LabeledContent("Topic") {
+                        TextField("ME193/Rogers/Codrin", text: $mqttTopic)
+                            .multilineTextAlignment(.trailing)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                            .onSubmit { model.viewer.mqttTopic = mqttTopic }
+                    }
+                } header: {
+                    Text("Score posting (MQTT)")
+                } footer: {
+                    Text("\(model.mqttStatus)\n\nPosts the record number of continuous hits (my hits in a row that land on the AI's half) as a float, retained, on port 1883.")
                 }
                 Section {
                     Toggle("Smart paddle", isOn: $model.viewer.smartPaddle)
@@ -191,7 +220,11 @@ struct CalibrationView: View {
                     Button("Reset everything to defaults (VRG Pro)", role: .destructive) { model.viewer = ViewerProfile() }
                 }
             }
-            .onAppear { paddleHost = model.viewer.paddleHost }
+            .onAppear {
+                paddleHost = model.viewer.paddleHost
+                mqttHost = model.viewer.mqttHost
+                mqttTopic = model.viewer.mqttTopic
+            }
             .navigationTitle("Calibration")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {

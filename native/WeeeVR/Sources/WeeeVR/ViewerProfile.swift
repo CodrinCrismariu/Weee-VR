@@ -69,6 +69,10 @@ struct ViewerProfile: Codable, Equatable {
     // Game
     var scene = GameScene.pingPong      // what is placed ahead on a tap
     var tableTag = true                 // put the table on its AprilTag (ID 67, 102.2 mm) when it's seen
+    var mqttEnabled = true              // post the record of continuous hits over MQTT
+    var mqttHost = "test.mosquitto.org" // broker (plain TCP, port 1883, no login)
+    var mqttTopic = "ME193/Rogers/Codrin"
+    var tableTagLabel = 0               // where tag 67's printed label faces: 0 me, 1 the far end, 2 my left, 3 my right
     var tableDropM: Float = 0.80        // table surface below the eyes (standing ~0.8, seated ~0.45)
     var opponentLevel: Float = 0.5      // 0 gentle ... 1 fast
     var assist: Float = 0.5             // 0 realistic ... 1: forgiving paddle, steered shots, slower ball
